@@ -672,6 +672,26 @@ function D4_ValidateCenterlineCandidate(path, company_id, required_heading) {
 	return true;
 }
 
+/* min_turn_run is a centerline contract, not merely an A* pruning hint. The
+ * emitted route must leave this function with every trajectory correction
+ * separated by that many tiles, including the station approaches. This catches
+ * both adjacent one-tile jogs and staircase miters returned by an otherwise
+ * legal terrain-aware fallback. */
+function D4_HasMinimumCurveRun(path, min_turn_run) {
+	if (!D4_IsArray(path) || path.len() < 2) return false;
+	if (min_turn_run <= 0) return true;
+	local last_turn_index = -1;
+	for (local i = 1; i + 1 < path.len(); i++) {
+		local incoming = D4_DirectionBetween(path[i - 1], path[i]);
+		local outgoing = D4_DirectionBetween(path[i], path[i + 1]);
+		if (incoming < 0 || outgoing < 0) return false;
+		if (incoming == outgoing) continue;
+		if (i < min_turn_run || (last_turn_index >= 0 && i - last_turn_index < min_turn_run)) return false;
+		last_turn_index = i;
+	}
+	return last_turn_index < 0 || path.len() - 1 - last_turn_index >= min_turn_run;
+}
+
 function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start_dir = -1, required_goal_dir = -1, max_turns = -1, turn_cost_override = -1, min_turn_run = 0, require_paired_lane = false, paired_start = null, paired_end = null, paired_start_heading = -1, paired_end_heading = -1) {
 	/* Paired RoRo endpoints normally face the same cardinal direction. Test the
 	 * complete bounded family of two-turn doglegs first: unlike generic A*, this
@@ -679,17 +699,18 @@ function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start
 	 * lane and costs only O(distance squared) test-mode rail probes. */
 	if (min_turn_run > 0 && required_start_dir >= 0 && required_start_dir == required_goal_dir) {
 		local dogleg = D4_BuildTwoTurnCenterline(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane, paired_start, paired_end, paired_start_heading, paired_end_heading);
-		if (dogleg.ok) return dogleg;
+		if (dogleg.ok && D4_HasMinimumCurveRun(dogleg.path, min_turn_run)) return dogleg;
 		/* Reserve the final straight before generic search. The unconstrained A*
 		 * previously reached the goal with a one-tile corrective miter; routing to
 		 * a shifted approach point makes the required terminal run structural. */
 		local approach = D4_Offset(goal, D4_RotateDir(required_goal_dir, 2), min_turn_run);
-		if (!D4_IsPointOnMap(approach)) return dogleg;
-		local prefix = D4_BuildLegalCenterline(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, 0, false);
+		if (!D4_IsPointOnMap(approach)) return { ok = false, error = D4_Error("curve_run_approach_out_of_map", D4_PointKey(approach)) };
+		local prefix = D4_BuildLegalCenterline(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, min_turn_run, false);
 		if (!prefix.ok) return prefix;
 		local combined = [];
 		foreach (point in prefix.path) D4_AppendPointIfNew(combined, point);
 		for (local tail = min_turn_run - 1; tail >= 0; tail--) D4_AppendPointIfNew(combined, D4_Offset(goal, D4_RotateDir(required_goal_dir, 2), tail));
+		if (!D4_HasMinimumCurveRun(combined, min_turn_run)) return { ok = false, error = D4_Error("approach_extension_curve_run", D4_PointKey(approach)) };
 		if (!D4_ValidateCenterlineCandidate(combined, company_id, required_goal_dir)) return { ok = false, error = D4_Error("approach_extension_unbuildable", D4_PointKey(approach)) };
 		if (require_paired_lane && !D4_HasBuildablePairedLane(combined, company_id, paired_start, paired_end, paired_start_heading, paired_end_heading)) return { ok = false, error = D4_Error("paired_extension_unbuildable", D4_PointKey(approach)) };
 		return { ok = true, path = combined };
@@ -723,7 +744,10 @@ function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start
 		if (key in visited) continue;
 		visited[key] <- true;
 		expansions++;
-		if (node.point.x == goal.x && node.point.y == goal.y && (min_turn_run <= 0 || node.run >= min_turn_run)) return D4_ProgramReconstruct(nodes, node, max_len);
+		if (node.point.x == goal.x && node.point.y == goal.y && (min_turn_run <= 0 || node.run >= min_turn_run)) {
+			local candidate = D4_ProgramReconstruct(nodes, node, max_len);
+			if (candidate.ok && D4_HasMinimumCurveRun(candidate.path, min_turn_run)) return candidate;
+		}
 		if (node.steps >= max_len) continue;
 		local dirs = D4_ProgramDirections(node.dir, node.point, goal);
 		foreach (dir in dirs) {

@@ -254,6 +254,33 @@ test("Single-shuttle routing uses the real station tiles as endpoint context", (
   assert.match(gate, /entries_each !== 111/);
 });
 
+test("Single-shuttle curve-run contract rejects observed one-tile jog and staircase corrections", () => {
+  const program = readFileSync(join(gameDir, "build_program.nut"), "utf8");
+  const hasMinimumCurveRun = (path: readonly { x: number; y: number }[], minimum: number) => {
+    let lastTurn = -1;
+    for (let index = 1; index + 1 < path.length; index += 1) {
+      const incoming = `${path[index]!.x - path[index - 1]!.x},${path[index]!.y - path[index - 1]!.y}`;
+      const outgoing = `${path[index + 1]!.x - path[index]!.x},${path[index + 1]!.y - path[index]!.y}`;
+      if (incoming === outgoing) continue;
+      if (index < minimum || (lastTurn >= 0 && index - lastTurn < minimum)) return false;
+      lastTurn = index;
+    }
+    return lastTurn < 0 || path.length - 1 - lastTurn >= minimum;
+  };
+  const adjacentJog = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 2, y: 0 }, { x: 3, y: 0 }, { x: 3, y: 1 }, { x: 4, y: 1 }, { x: 5, y: 1 }, { x: 6, y: 1 }];
+  const staircase = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 2, y: 1 }, { x: 2, y: 2 }, { x: 3, y: 2 }];
+  const separatedCorrections = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 2, y: 0 }, { x: 3, y: 0 }, { x: 3, y: 1 }, { x: 3, y: 2 }, { x: 3, y: 3 }, { x: 4, y: 3 }, { x: 5, y: 3 }, { x: 6, y: 3 }];
+
+  assert.equal(hasMinimumCurveRun(adjacentJog, 3), false, "plan-1/plan-3 one-tile lateral jog");
+  assert.equal(hasMinimumCurveRun(staircase, 3), false, "plan-2 consecutive staircase jogs");
+  assert.equal(hasMinimumCurveRun(separatedCorrections, 3), true);
+  assert.match(program, /function D4_HasMinimumCurveRun\(path, min_turn_run\)/);
+  assert.match(program, /dogleg\.ok && D4_HasMinimumCurveRun\(dogleg\.path, min_turn_run\)/);
+  assert.match(program, /turn_cost_override, min_turn_run, false\)/);
+  assert.match(program, /curve_run_approach_out_of_map/);
+  assert.match(program, /candidate\.ok && D4_HasMinimumCurveRun\(candidate\.path, min_turn_run\)/);
+});
+
 test("Through-hub blueprint is populated in every definition table", () => {
   const blueprint = readFileSync(join(gameDir, "blueprint.nut"), "utf8");
   assert.match(blueprint, /local defs = \{/);
@@ -327,7 +354,7 @@ test("Paired corridor connects through-hub endpoints through common fan and merg
   assert.match(program, /A pure cross-axis run between forward runs draws a slowing 90/);
   assert.match(program, /D4_BuildTwoTurnCenterline\(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane, paired_start, paired_end, paired_start_heading, paired_end_heading\)/);
   assert.match(program, /local approach = D4_Offset\(goal, D4_RotateDir\(required_goal_dir, 2\), min_turn_run\)/);
-  assert.match(program, /local prefix = D4_BuildLegalCenterline\(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, 0, false\)/);
+  assert.match(program, /local prefix = D4_BuildLegalCenterline\(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, min_turn_run, false\)/);
   assert.match(program, /function D4_ValidateCenterlineCandidate/);
   assert.match(program, /turning && min_turn_run > 0 && node\.run < min_turn_run/);
   assert.match(program, /node\.point\.x == goal\.x && node\.point\.y == goal\.y && \(min_turn_run <= 0 \|\| node\.run >= min_turn_run\)/);
