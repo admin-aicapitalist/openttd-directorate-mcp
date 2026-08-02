@@ -163,6 +163,7 @@ function pathKeys(paths: readonly (readonly Point[])[]) {
 }
 
 export function deriveThroughHubRoroGeometry(numPlatforms: number, platformLength: number, rotation = 0, origin: Point = { x: 0, y: 0 }) {
+  const curveClearance = platformLength;
   const platformFront: Point[] = [];
   const platformRear: Point[] = [];
   const throatSw: Point[] = [];
@@ -177,13 +178,17 @@ export function deriveThroughHubRoroGeometry(numPlatforms: number, platformLengt
     join.push(rotatePoint({ x: -numPlatforms - 1 + track, y: track }, rotation, origin));
     mergeJoin.push(rotatePoint({ x: platformLength + numPlatforms - 1 - track, y: track }, rotation, origin));
   }
-  const commonInbound = rotatePoint({ x: -numPlatforms - 2, y: -1 }, rotation, origin);
-  const commonOutbound = rotatePoint({ x: -numPlatforms - 2, y: -2 }, rotation, origin);
+  const commonInbound = rotatePoint({ x: -numPlatforms - 2 - curveClearance, y: -1 - curveClearance }, rotation, origin);
+  const commonOutbound = rotatePoint({ x: -numPlatforms - 2 - curveClearance, y: -2 - curveClearance }, rotation, origin);
   const commonRearMerge = rotatePoint({ x: platformLength + numPlatforms, y: -1 }, rotation, origin);
   const fanBackbone: Point[] = [];
+  appendPoint(fanBackbone, commonInbound);
+  for (let step = curveClearance - 1; step >= 0; step -= 1) {
+    appendPoint(fanBackbone, rotatePoint({ x: -numPlatforms - 2 - step, y: -2 - step }, rotation, origin));
+    appendPoint(fanBackbone, rotatePoint({ x: -numPlatforms - 2 - step, y: -1 - step }, rotation, origin));
+  }
   for (let index = 0; index < numPlatforms; index += 1) {
     if (index === 0) {
-      appendPoint(fanBackbone, rotatePoint({ x: -numPlatforms - 2, y: -1 }, rotation, origin));
       appendPoint(fanBackbone, rotatePoint({ x: -numPlatforms - 1, y: -1 }, rotation, origin));
       appendPoint(fanBackbone, rotatePoint({ x: -numPlatforms - 1, y: 0 }, rotation, origin));
     } else {
@@ -222,7 +227,13 @@ export function deriveThroughHubRoroGeometry(numPlatforms: number, platformLengt
     return path;
   });
   const loopPath: Point[] = [commonRearMerge, rotatePoint({ x: platformLength + numPlatforms, y: -2 }, rotation, origin)];
-  for (let x = platformLength + numPlatforms - 1; x >= -numPlatforms - 2; x -= 1) appendPoint(loopPath, rotatePoint({ x, y: -2 }, rotation, origin));
+  for (let step = 1; step <= curveClearance; step += 1) {
+    appendPoint(loopPath, rotatePoint({ x: platformLength + numPlatforms - step, y: -1 - step }, rotation, origin));
+    appendPoint(loopPath, rotatePoint({ x: platformLength + numPlatforms - step, y: -2 - step }, rotation, origin));
+  }
+  for (let x = platformLength + numPlatforms - curveClearance - 1; x >= -numPlatforms - 2 - curveClearance; x -= 1) {
+    appendPoint(loopPath, rotatePoint({ x, y: -2 - curveClearance }, rotation, origin));
+  }
   const station = new Set<string>();
   for (let y = 0; y < numPlatforms; y += 1) {
     for (let x = 0; x < platformLength; x += 1) station.add(`${rotatePoint({ x, y }, rotation, origin).x},${rotatePoint({ x, y }, rotation, origin).y}`);
@@ -230,8 +241,8 @@ export function deriveThroughHubRoroGeometry(numPlatforms: number, platformLengt
   const fanMergeLoop = pathKeys([...fanPaths, ...mergePaths, loopPath]);
   const overlap = [...station].filter((key) => fanMergeLoop.has(key));
   const envelope: Point[] = [];
-  for (let x = -numPlatforms - 2; x <= platformLength + numPlatforms; x += 1) {
-    for (let y = -2; y <= numPlatforms; y += 1) envelope.push(rotatePoint({ x, y }, rotation, origin));
+  for (let x = -numPlatforms - 2 - curveClearance; x <= platformLength + numPlatforms; x += 1) {
+    for (let y = -2 - curveClearance; y <= numPlatforms; y += 1) envelope.push(rotatePoint({ x, y }, rotation, origin));
   }
   return {
     ports: { platformFront, platformRear, throatSw, throatNe, commonInbound, commonOutbound, commonRearMerge },

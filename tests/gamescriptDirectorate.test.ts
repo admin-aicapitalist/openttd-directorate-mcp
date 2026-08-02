@@ -241,8 +241,8 @@ test("Through-hub blueprint is populated in every definition table", () => {
   assert.match(blueprint, /ports\.throat_sw\.append\(\{ x = -1, y = y \}\)/);
   assert.match(blueprint, /platform_front/);
   assert.match(blueprint, /platform_rear/);
-  assert.match(blueprint, /ports\.common_inbound = \[\{ x = -num_platforms - 2, y = -1 \}\]/);
-  assert.match(blueprint, /ports\.common_outbound = \[\{ x = -num_platforms - 2, y = -2 \}\]/);
+  assert.match(blueprint, /ports\.common_inbound = \[\{ x = -num_platforms - 2 - platform_length, y = -1 - platform_length \}\]/);
+  assert.match(blueprint, /ports\.common_outbound = \[\{ x = -num_platforms - 2 - platform_length, y = -2 - platform_length \}\]/);
   assert.match(blueprint, /ports\.common_rear_merge = \[\{ x = platform_length \+ num_platforms, y = -1 \}\]/);
   assert.doesNotMatch(blueprint, /ports\.throat_ne\.append\(\{ x = x, y = -1 \}\)/);
   assert.doesNotMatch(blueprint, /function D4_SetupThroughHub\(\)\s*\{\s*local defs = D4_GetBlueprintDefinitions\(\)/);
@@ -295,6 +295,8 @@ test("Paired corridor connects through-hub endpoints through common fan and merg
   assert.match(program, /curve_clearance_relaxed = curve_clearance_relaxed/);
   assert.match(program, /function D4_HasBuildablePairedLane/);
   assert.match(program, /function D4_BuildTwoTurnCenterline/);
+  assert.match(program, /function D4_AppendMiteredShift/);
+  assert.match(program, /A pure cross-axis run between forward runs draws a slowing 90/);
   assert.match(program, /D4_BuildTwoTurnCenterline\(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane\)/);
   assert.match(program, /local approach = D4_Offset\(goal, D4_RotateDir\(required_goal_dir, 2\), min_turn_run\)/);
   assert.match(program, /local prefix = D4_BuildLegalCenterline\(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, 0, false\)/);

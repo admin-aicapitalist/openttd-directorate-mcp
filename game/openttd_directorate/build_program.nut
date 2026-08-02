@@ -304,8 +304,8 @@ function D4_DeriveThroughHubEndpointLayout(blueprint) {
 	local platform_count = blueprint.ports.throat_sw.len();
 	local platform_length = abs(blueprint.ports.throat_ne[0].x - blueprint.ports.throat_sw[0].x) + abs(blueprint.ports.throat_ne[0].y - blueprint.ports.throat_sw[0].y) - 1;
 	if (platform_length < 1) return { ok = false, error = D4_Error("through_hub_length_invalid", blueprint.name) };
-	local common_inbound = D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2, y = -1 });
-	local common_outbound = D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2, y = -2 });
+	local common_inbound = D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2 - platform_length, y = -1 - platform_length });
+	local common_outbound = D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2 - platform_length, y = -2 - platform_length });
 	local common_rear_merge = D4_RotateBlueprintPoint(blueprint, { x = platform_length + platform_count, y = -1 });
 	local platform_front = [], platform_rear = [], throat_sw = [], throat_ne = [], join = [], merge_join = [];
 	local fan_paths = [], merge_paths = [];
@@ -319,9 +319,13 @@ function D4_DeriveThroughHubEndpointLayout(blueprint) {
 		join.append(D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 1 + i, y = i }));
 		merge_join.append(D4_RotateBlueprintPoint(blueprint, { x = platform_length + platform_count - 1 - i, y = i }));
 	}
+	D4_AppendPointIfNew(fan_backbone, common_inbound);
+	for (local entry_step = platform_length - 1; entry_step >= 0; entry_step--) {
+		D4_AppendPointIfNew(fan_backbone, D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2 - entry_step, y = -2 - entry_step }));
+		D4_AppendPointIfNew(fan_backbone, D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2 - entry_step, y = -1 - entry_step }));
+	}
 	for (local b = 0; b < platform_count; b++) {
 		if (b == 0) {
-			D4_AppendPointIfNew(fan_backbone, D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 2, y = -1 }));
 			D4_AppendPointIfNew(fan_backbone, D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 1, y = -1 }));
 			D4_AppendPointIfNew(fan_backbone, D4_RotateBlueprintPoint(blueprint, { x = -platform_count - 1, y = 0 }));
 		} else {
@@ -357,7 +361,11 @@ function D4_DeriveThroughHubEndpointLayout(blueprint) {
 		merge_paths.append(merge);
 	}
 	local loop_path = [common_rear_merge, D4_RotateBlueprintPoint(blueprint, { x = platform_length + platform_count, y = -2 })];
-	for (local lx = platform_length + platform_count - 1; lx >= -platform_count - 2; lx--) D4_AppendPointIfNew(loop_path, D4_RotateBlueprintPoint(blueprint, { x = lx, y = -2 }));
+	for (local loop_step = 1; loop_step <= platform_length; loop_step++) {
+		D4_AppendPointIfNew(loop_path, D4_RotateBlueprintPoint(blueprint, { x = platform_length + platform_count - loop_step, y = -1 - loop_step }));
+		D4_AppendPointIfNew(loop_path, D4_RotateBlueprintPoint(blueprint, { x = platform_length + platform_count - loop_step, y = -2 - loop_step }));
+	}
+	for (local lx = platform_length + platform_count - platform_length - 1; lx >= -platform_count - 2 - platform_length; lx--) D4_AppendPointIfNew(loop_path, D4_RotateBlueprintPoint(blueprint, { x = lx, y = -2 - platform_length }));
 	local loop_exit_heading = D4_DirectionBetween(loop_path[loop_path.len() - 2], common_outbound);
 	local fan_entry_heading = fan_backbone.len() > 1 ? D4_DirectionBetween(common_inbound, fan_backbone[1]) : -1;
 	if (loop_exit_heading < 0 || fan_entry_heading < 0) return { ok = false, error = D4_Error("through_hub_endpoint_heading_invalid", blueprint.name) };
@@ -595,19 +603,40 @@ function D4_BuildTwoTurnCenterline(start, goal, company_id, heading, min_run, re
 	local horizontal = heading == DIR_NE || heading == DIR_SW;
 	local forward_delta = horizontal ? goal.x - start.x : goal.y - start.y;
 	local forward_step = heading == DIR_NE || heading == DIR_SE ? 1 : -1;
-	if (forward_delta * forward_step < min_run * 2) return { ok = false, error = D4_Error("dogleg_forward_span", forward_delta.tostring()) };
 	local cross_delta = horizontal ? goal.y - start.y : goal.x - start.x;
-	if (cross_delta != 0 && abs(cross_delta) < min_run) return { ok = false, error = D4_Error("dogleg_cross_span", cross_delta.tostring()) };
+	local cross_span = abs(cross_delta);
+	/* A true visual 45-degree transition is a staircase of alternating map-axis
+	 * steps. A pure cross-axis run between forward runs draws a slowing 90. */
+	if (forward_delta * forward_step < min_run * 2 + cross_span) return { ok = false, error = D4_Error("dogleg_forward_span", forward_delta.tostring()) };
+	if (cross_delta != 0 && cross_span < min_run) return { ok = false, error = D4_Error("dogleg_cross_span", cross_delta.tostring()) };
 	local forward_span = abs(forward_delta);
-	for (local first_run = min_run; first_run <= forward_span - min_run; first_run++) {
+	for (local first_run = min_run; first_run <= forward_span - cross_span - min_run; first_run++) {
 		local path = [start];
 		local bend_value = (horizontal ? start.x : start.y) + forward_step * first_run;
 		if (!D4_AppendAxisTo(path, horizontal ? "x" : "y", bend_value)) continue;
-		if (!D4_AppendAxisTo(path, horizontal ? "y" : "x", horizontal ? goal.y : goal.x)) continue;
+		if (!D4_AppendMiteredShift(path, horizontal, horizontal ? goal.y : goal.x, forward_step)) continue;
 		if (!D4_AppendAxisTo(path, horizontal ? "x" : "y", horizontal ? goal.x : goal.y)) continue;
 		if (D4_ValidateCenterlineCandidate(path, company_id, heading) && (!require_paired_lane || D4_HasBuildablePairedLane(path, company_id))) return { ok = true, path = path };
 	}
 	return { ok = false, error = D4_Error("dogleg_not_found", D4_PointKey(start) + "->" + D4_PointKey(goal)) };
+}
+
+function D4_AppendMiteredShift(path, horizontal, cross_target, forward_step) {
+	if (!D4_IsArray(path) || path.len() < 1 || (forward_step != 1 && forward_step != -1)) return false;
+	local guard = 0;
+	while ((horizontal ? path[path.len() - 1].y : path[path.len() - 1].x) != cross_target && guard < 384) {
+		local last = path[path.len() - 1];
+		local cross = horizontal ? last.y : last.x;
+		local cross_step = cross < cross_target ? 1 : -1;
+		local shifted = { x = last.x, y = last.y };
+		if (horizontal) shifted.y += cross_step; else shifted.x += cross_step;
+		D4_AppendPointIfNew(path, shifted);
+		local advanced = { x = shifted.x, y = shifted.y };
+		if (horizontal) advanced.x += forward_step; else advanced.y += forward_step;
+		D4_AppendPointIfNew(path, advanced);
+		guard++;
+	}
+	return (horizontal ? path[path.len() - 1].y : path[path.len() - 1].x) == cross_target;
 }
 
 function D4_AppendAxisTo(path, axis, target) {

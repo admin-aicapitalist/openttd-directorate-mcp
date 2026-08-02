@@ -261,8 +261,8 @@ function D4_SetupThroughHub(defs, name, num_platforms, platform_length) {
 		required.append({ x = platform_length, y = y });
 		required.append({ x = -1, y = y });
 	}
-	ports.common_inbound = [{ x = -num_platforms - 2, y = -1 }];
-	ports.common_outbound = [{ x = -num_platforms - 2, y = -2 }];
+	ports.common_inbound = [{ x = -num_platforms - 2 - platform_length, y = -1 - platform_length }];
+	ports.common_outbound = [{ x = -num_platforms - 2 - platform_length, y = -2 - platform_length }];
 	ports.common_rear_merge = [{ x = platform_length + num_platforms, y = -1 }];
 	/* Reserve the physical RoRo geometry, not its entire bounding rectangle.
 	 * The rectangular reserve rejected valid mirrored sites whenever the
@@ -270,8 +270,12 @@ function D4_SetupThroughHub(defs, name, num_platforms, platform_length) {
 	for (local station_y = 0; station_y < num_platforms; station_y++) {
 		for (local station_x = 0; station_x < platform_length; station_x++) D4_AppendRequiredPoint(required, { x = station_x, y = station_y });
 	}
-	/* Shared diagonal entry fan and each horizontal platform branch. */
-	D4_AppendRequiredPoint(required, { x = -num_platforms - 2, y = -1 });
+	/* Shared mitered entry, diagonal fan and each horizontal platform branch. */
+	D4_AppendRequiredPoint(required, { x = -num_platforms - 2 - platform_length, y = -1 - platform_length });
+	for (local entry_step = platform_length - 1; entry_step >= 0; entry_step--) {
+		D4_AppendRequiredPoint(required, { x = -num_platforms - 2 - entry_step, y = -2 - entry_step });
+		D4_AppendRequiredPoint(required, { x = -num_platforms - 2 - entry_step, y = -1 - entry_step });
+	}
 	for (local fan_row = 0; fan_row < num_platforms; fan_row++) {
 		if (fan_row == 0) {
 			D4_AppendRequiredPoint(required, { x = -num_platforms - 1, y = -1 });
@@ -292,9 +296,14 @@ function D4_SetupThroughHub(defs, name, num_platforms, platform_length) {
 	}
 	D4_AppendRequiredPoint(required, { x = platform_length + num_platforms, y = 0 });
 	D4_AppendRequiredPoint(required, { x = platform_length + num_platforms, y = -1 });
-	/* Local rear turnback runs outside the platform body back to the paired port. */
+	/* Rear turnback: alternating map-axis steps are a visually straight 45-degree
+	 * miter. The old pure y-run followed by pure x-run was the slowing 90. */
 	D4_AppendRequiredPoint(required, { x = platform_length + num_platforms, y = -2 });
-	for (local loop_x = platform_length + num_platforms - 1; loop_x >= -num_platforms - 2; loop_x--) D4_AppendRequiredPoint(required, { x = loop_x, y = -2 });
+	for (local loop_step = 1; loop_step <= platform_length; loop_step++) {
+		D4_AppendRequiredPoint(required, { x = platform_length + num_platforms - loop_step, y = -1 - loop_step });
+		D4_AppendRequiredPoint(required, { x = platform_length + num_platforms - loop_step, y = -2 - loop_step });
+	}
+	for (local loop_x = platform_length + num_platforms - platform_length - 1; loop_x >= -num_platforms - 2 - platform_length; loop_x--) D4_AppendRequiredPoint(required, { x = loop_x, y = -2 - platform_length });
 	ports.feeder_port = [{ x = -1, y = 0 }, { x = -1, y = num_platforms - 1 }];
 	foreach (feeder in ports.feeder_port) D4_AppendRequiredPoint(required, feeder);
 	defs[name].tiles = tiles;

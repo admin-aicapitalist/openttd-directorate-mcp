@@ -114,8 +114,8 @@ test("through-hub RoRo ports expose common inbound, all platforms, and common ou
     platformRear: [{ x: 3, y: 0 }, { x: 3, y: 1 }],
     throatSw: [{ x: -1, y: 0 }, { x: -1, y: 1 }],
     throatNe: [{ x: 4, y: 0 }, { x: 4, y: 1 }],
-    commonInbound: { x: -4, y: -1 },
-    commonOutbound: { x: -4, y: -2 },
+    commonInbound: { x: -8, y: -5 },
+    commonOutbound: { x: -8, y: -6 },
     commonRearMerge: { x: 6, y: -1 },
   });
   assert.deepEqual(deriveThroughHubRoroPorts(4, 7, 1, { x: 100, y: 200 }), {
@@ -123,8 +123,8 @@ test("through-hub RoRo ports expose common inbound, all platforms, and common ou
     platformRear: [{ x: 100, y: 206 }, { x: 99, y: 206 }, { x: 98, y: 206 }, { x: 97, y: 206 }],
     throatSw: [{ x: 100, y: 199 }, { x: 99, y: 199 }, { x: 98, y: 199 }, { x: 97, y: 199 }],
     throatNe: [{ x: 100, y: 207 }, { x: 99, y: 207 }, { x: 98, y: 207 }, { x: 97, y: 207 }],
-    commonInbound: { x: 101, y: 194 },
-    commonOutbound: { x: 102, y: 194 },
+    commonInbound: { x: 108, y: 187 },
+    commonOutbound: { x: 109, y: 187 },
     commonRearMerge: { x: 101, y: 211 },
   });
 });
@@ -160,6 +160,12 @@ test("through-hub RoRo deterministic fan, merge, and loop geometry is legal for 
       assertLegalPath(hub.loopPath);
       assert.ok(hub.loopPath.length >= length + platforms + 2);
       assert.equal(new Set(hub.loopPath.map((point) => `${point.x},${point.y}`)).size, hub.loopPath.length);
+      const fanMiter = hub.fanBackbone.slice(0, length * 2 + 1);
+      const loopMiter = hub.loopPath.slice(1, length * 2 + 2);
+      for (const miter of [fanMiter, loopMiter]) {
+        const directions = miter.slice(1).map((point, index) => directionBetween(miter[index]!, point));
+        assert.ok(directions.every((direction, index) => index === 0 || direction !== directions[index - 1]), "miter must alternate map axes instead of drawing an axis-aligned L");
+      }
     }
   }
 });
@@ -185,9 +191,9 @@ test("through-hub endpoint headings reject the observed rotation0/rotation2 U-tu
 
 test("through-hub endpoint headings pass a mirrored non-reversing pair", () => {
   const source = deriveThroughHubRoroGeometry(2, 4, 2, { x: 50, y: 50 });
-  const destination = deriveThroughHubRoroGeometry(2, 4, 0, { x: 70, y: 52 });
+  const destination = deriveThroughHubRoroGeometry(2, 4, 0, { x: 80, y: 52 });
   const sourceHeadings = throughHubEndpointHeadings(2, 4, 2, { x: 50, y: 50 });
-  const destinationHeadings = throughHubEndpointHeadings(2, 4, 0, { x: 70, y: 52 });
+  const destinationHeadings = throughHubEndpointHeadings(2, 4, 0, { x: 80, y: 52 });
 
   assert.equal(sourceHeadings.loopExitHeading, dominantDirection(source.ports.commonOutbound, destination.ports.commonInbound));
   assert.equal(destinationHeadings.loopExitHeading, dominantDirection(destination.ports.commonOutbound, source.ports.commonInbound));
