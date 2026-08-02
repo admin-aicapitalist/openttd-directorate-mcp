@@ -6,6 +6,9 @@ class DirectorateM4PlanStore {
 	registry = null;
 	deferred_plans = null;
 	deferred_plan_order = null;
+	campaign_id = null;
+	campaign_started_date = 0;
+	campaign_started_tick = 0;
 
 	constructor() {
 		this.plans = {};
@@ -14,6 +17,9 @@ class DirectorateM4PlanStore {
 		this.registry = DirectorateM4RouteRegistry();
 		this.deferred_plans = {};
 		this.deferred_plan_order = [];
+		this.campaign_id = D4_NewUUID();
+		this.campaign_started_date = GSDate.GetCurrentDate();
+		this.campaign_started_tick = D4_Tick();
 	}
 
 	function Save() {
@@ -25,7 +31,7 @@ class DirectorateM4PlanStore {
 			foreach (id in this.deferred_plan_order) { if (id in this.deferred_plans) { saved_plans[id] <- this.deferred_plans[id]; saved_order.append(id); } }
 			foreach (id in this.order) { if (id in this.plans) { saved_plans[id] <- this.plans[id]; saved_order.append(id); } }
 		}
-		return { plans = saved_plans, order = saved_order, next_id = this.next_id, journal = this.journal.Save(), registry = this.registry.Save() };
+		return { plans = saved_plans, order = saved_order, next_id = this.next_id, journal = this.journal.Save(), registry = this.registry.Save(), campaign_id = this.campaign_id, campaign_started_date = this.campaign_started_date, campaign_started_tick = this.campaign_started_tick };
 	}
 
 	function Load(data) { this.BeginLoad(data); }
@@ -41,6 +47,9 @@ class DirectorateM4PlanStore {
 			GSLog.Warning("D4 M4 plan-store load rejected shape");
 			return;
 		}
+		if (D4_Has(data, "campaign_id") && typeof data.campaign_id == "string" && data.campaign_id.len() >= 8 && data.campaign_id.len() <= 64) this.campaign_id = data.campaign_id;
+		if (D4_Has(data, "campaign_started_date") && typeof data.campaign_started_date == "integer") this.campaign_started_date = data.campaign_started_date;
+		if (D4_Has(data, "campaign_started_tick") && typeof data.campaign_started_tick == "integer") this.campaign_started_tick = data.campaign_started_tick;
 		this.deferred_plans = data.plans;
 		this.deferred_plan_order = data.order;
 		if ("next_id" in data && typeof data.next_id == "integer") this.next_id = D4_ClampInt(data.next_id, 0, 0, 1000000000);
@@ -292,8 +301,18 @@ class DirectorateM4PlanStore {
 		if (scope == "routes") {
 			return this.registry.Observe(request);
 		}
+		if (scope == "map") return { ok = true, payload = this.GameState() };
+		if (scope == "company") {
+			if (!D4_Has(request, "company_id")) return { ok = false, error = D4_Error("company_id_required", "company") };
+			return D4_CompanySnapshot(request.company_id);
+		}
 		if (scope == "economy") {
-			return { ok = true, payload = { scope = "economy", company_id = D4_Has(request, "company_id") ? request.company_id : null, tick = D4_Tick() } };
+			if (!D4_Has(request, "company_id")) return { ok = false, error = D4_Error("company_id_required", "economy") };
+			local snapshot = D4_CompanySnapshot(request.company_id);
+			if (!snapshot.ok) return snapshot;
+			snapshot.payload.scope <- "economy";
+			snapshot.payload.campaign_id <- this.campaign_id;
+			return snapshot;
 		}
 		if (D4_Has(request, "route_id") && request.route_id in this.plans) {
 			rows.append(this.Summary(this.plans[request.route_id]));
@@ -306,7 +325,22 @@ class DirectorateM4PlanStore {
 				rows.append(this.Summary(plan));
 			}
 		}
-		return { ok = true, payload = { scope = scope, plans = rows, tick = D4_Tick() } };
+		return { ok = true, payload = { scope = scope, plans = rows, campaign_id = this.campaign_id, tick = D4_Tick() } };
+	}
+
+	function GameState() {
+		local current_date = GSDate.GetCurrentDate();
+		return {
+			scope = "map",
+			campaign_id = this.campaign_id,
+			campaign_started_date = this.campaign_started_date,
+			campaign_started_tick = this.campaign_started_tick,
+			current_date = current_date,
+			current_year = GSDate.GetYear(current_date),
+			map_size_x = GSMap.GetMapSizeX(),
+			map_size_y = GSMap.GetMapSizeY(),
+			tick = D4_Tick(),
+		};
 	}
 
 	function Verify(company_id, plan_or_route_id, level, is_operation_id = false) {

@@ -36,6 +36,29 @@ function D4_BuildBlueprint(name, rotation, origin, overrides) {
 	local defs = D4_GetBlueprintDefinitions();
 	if (!(name in defs)) return { ok = false, error = D4_Error("unknown_blueprint", name) };
 	local raw = defs[name];
+	if (name == "single_shuttle_1xN") {
+		local platform_length = D4_ClampInt(D4_Has(overrides, "platform_length") ? overrides.platform_length : 1, 1, 1, 7);
+		local dynamic_tiles = [];
+		local dynamic_clear = [];
+		local dynamic_body = [];
+		for (local cell = 0; cell < platform_length; cell++) {
+			local station_point = { x = 0, y = cell };
+			dynamic_tiles.append(D4_BlueprintTile(station_point, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }));
+			dynamic_clear.append(station_point);
+			dynamic_body.append(station_point);
+		}
+		local throat = { x = 0, y = platform_length };
+		local depot = { x = 0, y = platform_length + 1 };
+		dynamic_tiles.append(D4_BlueprintTile(throat, "rail", { dir = DIR_NE }));
+		dynamic_tiles.append(D4_BlueprintTile(depot, "depot", { dir = DIR_NE, in_dir = DIR_NE, out_dir = DIR_NE }));
+		dynamic_clear.append(throat);
+		dynamic_clear.append(depot);
+		raw = {
+			origin = { x = 0, y = 0 }, station_name = "single_shuttle_1xN", station_id = GSStation.STATION_NEW,
+			tiles = dynamic_tiles, required_clear = dynamic_clear, allowed_existing = [],
+			ports = { platform_body = dynamic_body, throat = [throat], depot_mouth = [depot] },
+		};
+	}
 	local tiles = [];
 	local ports = {};
 	local required_clear = [];

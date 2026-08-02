@@ -478,6 +478,23 @@ async function main() {
       const startAi = await client.rcon('start_ai "Directorate Gate Fixture"');
       evidence.steps.push({ name: "start_fixture_company", response: startAi });
       await delay(1000);
+      const gameState = assertOk("get_game_state", await request(handlers, "execute", {
+        company_id: 0,
+        command: "get_game_state",
+        params: {},
+      }));
+      if (typeof gameState.payload?.campaign_id !== "string" || gameState.payload.campaign_id.length < 8) {
+        throw new Error(`game state did not expose a campaign epoch: ${JSON.stringify(gameState)}`);
+      }
+      const companyInfo = assertOk("get_company_info", await request(handlers, "execute", {
+        company_id: 0,
+        command: "get_company_info",
+        params: {},
+      }));
+      if (typeof companyInfo.payload?.name !== "string" || companyInfo.payload.name.length < 1 || typeof companyInfo.payload?.bank_balance !== "number") {
+        throw new Error(`company info contract is incomplete: ${JSON.stringify(companyInfo)}`);
+      }
+      evidence.steps.push({ name: "campaign_identity", game_state: gameState, company_info: companyInfo });
       evidence.steps.push({ name: "observe", response: assertOk("observe", await request(handlers, "observe", { scope: "plans", limit: 4 })) });
 
       const industryWire = await client.requestGameScript("execute", {

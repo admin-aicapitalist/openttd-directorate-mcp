@@ -24,13 +24,14 @@ function D4_CompileBuildProgram(plan) {
 	 * shuttle, preserve the actual station tiles as the predecessor/successor
 	 * context in the emitted endpoint primitives.  Apply preflight tests those
 	 * exact primitives before any mutation. */
-	local source_entry = single_shuttle ? source_station.op.point : D4_NearestBlueprintPortPoint(plan.station_blueprint, "platform_body", start);
-	local destination_exit = single_shuttle ? destination_station.op.point : D4_NearestBlueprintPortPoint(plan.destination_blueprint, "platform_body", goal);
+	local source_entry = D4_NearestBlueprintPortPoint(plan.station_blueprint, "platform_body", start);
+	local destination_exit = D4_NearestBlueprintPortPoint(plan.destination_blueprint, "platform_body", goal);
 	if (source_entry == null || destination_exit == null) return { ok = false, error = D4_Error("program_missing_station_entries", "") };
 	local required_start_dir = D4_DirectionBetween(source_entry, start);
 	local required_goal_dir = D4_DirectionBetween(goal, destination_exit);
 	if (required_start_dir < 0 || required_goal_dir < 0) return { ok = false, error = D4_Error("program_invalid_station_heading", "") };
-	local route = D4_BuildLegalCenterline(start, goal, plan.company_id, plan.policy, required_start_dir, required_goal_dir);
+	local bootstrap_curve_run = single_shuttle ? D4_ClampInt(D4_Has(plan.policy, "minimum_curve_run") ? plan.policy.minimum_curve_run : 3, 3, 3, 12) : 0;
+	local route = D4_BuildLegalCenterline(start, goal, plan.company_id, plan.policy, required_start_dir, required_goal_dir, single_shuttle ? 4 : -1, single_shuttle ? 50 : -1, bootstrap_curve_run, false);
 	if (!route.ok) return route;
 	local paired = { ok = true, return_lane = [] };
 	local destination_return_entry = null;
@@ -147,13 +148,13 @@ function D4_CompileThroughHubRoroProgram(plan, source_station, destination_stati
 	 * full-length train cannot occupy both curve primitives simultaneously. */
 	local turn_clearance = source_manifest.manifest.platform_length;
 	if (dest_manifest.manifest.platform_length > turn_clearance) turn_clearance = dest_manifest.manifest.platform_length;
-	local outbound = D4_BuildLegalCenterline(source_out, dest_in, plan.company_id, plan.policy, source_manifest.manifest.loop_exit_heading, dest_manifest.manifest.fan_entry_heading, 4, 50, turn_clearance, true);
+	local outbound = D4_BuildLegalCenterline(source_out, dest_in, plan.company_id, plan.policy, source_manifest.manifest.loop_exit_heading, dest_manifest.manifest.fan_entry_heading, 4, 50, turn_clearance, true, dest_out, source_in, dest_manifest.manifest.loop_exit_heading, source_manifest.manifest.fan_entry_heading);
 	local curve_clearance_relaxed = false;
 	/* Terrain may make the full consist envelope impossible. Only then permit a
 	 * short paired 45-left/45-right trajectory correction; three tiles is the
 	 * minimum at which the offset lane miters remain valid. */
 	if (!outbound.ok && turn_clearance > 3) {
-		outbound = D4_BuildLegalCenterline(source_out, dest_in, plan.company_id, plan.policy, source_manifest.manifest.loop_exit_heading, dest_manifest.manifest.fan_entry_heading, 4, 50, 3, true);
+		outbound = D4_BuildLegalCenterline(source_out, dest_in, plan.company_id, plan.policy, source_manifest.manifest.loop_exit_heading, dest_manifest.manifest.fan_entry_heading, 4, 50, 3, true, dest_out, source_in, dest_manifest.manifest.loop_exit_heading, source_manifest.manifest.fan_entry_heading);
 		curve_clearance_relaxed = outbound.ok;
 	}
 	if (!outbound.ok) return outbound;
@@ -526,7 +527,7 @@ function D4_SelectBestSitePair(source_candidates, destination_candidates, exclud
 					local side = D4_RotateDir(source_to_destination, side_turns);
 					if (D4_PointKey(D4_Offset(source_throat, side, 1)) == D4_PointKey(source_platform) && D4_PointKey(D4_Offset(destination_throat, side, 1)) == D4_PointKey(destination_platform)) paired_ports = true;
 				}
-				if (!paired_ports) orientation_penalty += 1000000;
+				if (!paired_ports) continue;
 			} else {
 				if (source_out != source_to_destination) orientation_penalty += 100000;
 				if (destination_out != destination_to_source) orientation_penalty += 100000;
@@ -589,17 +590,23 @@ function D4_StationRectOperation(op_id, blueprint, destination_station) {
 	return { ok = true, op = { op_id = op_id, kind = "station_rect", tile = D4_ToTile(origin), point = origin, end_tile = D4_ToTile(endp), end_point = endp, direction = direction, num_platforms = num_platforms, platform_length = platform_length, destination_station = destination_station } };
 }
 
-function D4_HasBuildablePairedLane(path, company_id) {
+function D4_HasBuildablePairedLane(path, company_id, expected_start = null, expected_end = null, expected_start_heading = -1, expected_end_heading = -1) {
 	foreach (side_turns in [1, 3]) {
 		local candidate = D4_DeriveProgramLanes(path, side_turns);
 		if (!candidate.ok || candidate.return_lane.len() < 2) continue;
-		local heading = D4_DirectionBetween(candidate.return_lane[0], candidate.return_lane[1]);
-		if (heading >= 0 && D4_ValidateCenterlineCandidate(candidate.return_lane, company_id, heading)) return true;
+		local start_heading = D4_DirectionBetween(candidate.return_lane[0], candidate.return_lane[1]);
+		local end_heading = D4_DirectionBetween(candidate.return_lane[candidate.return_lane.len() - 2], candidate.return_lane[candidate.return_lane.len() - 1]);
+		if (expected_start != null && D4_PointKey(candidate.return_lane[0]) != D4_PointKey(expected_start)) continue;
+		if (expected_end != null && D4_PointKey(candidate.return_lane[candidate.return_lane.len() - 1]) != D4_PointKey(expected_end)) continue;
+		if (expected_start_heading >= 0 && start_heading != expected_start_heading) continue;
+		if (expected_end_heading >= 0 && end_heading != expected_end_heading) continue;
+		local validation_heading = expected_start_heading >= 0 ? expected_start_heading : start_heading;
+		if (validation_heading >= 0 && D4_ValidateCenterlineCandidate(candidate.return_lane, company_id, validation_heading)) return true;
 	}
 	return false;
 }
 
-function D4_BuildTwoTurnCenterline(start, goal, company_id, heading, min_run, require_paired_lane = false) {
+function D4_BuildTwoTurnCenterline(start, goal, company_id, heading, min_run, require_paired_lane = false, paired_start = null, paired_end = null, paired_start_heading = -1, paired_end_heading = -1) {
 	local horizontal = heading == DIR_NE || heading == DIR_SW;
 	local forward_delta = horizontal ? goal.x - start.x : goal.y - start.y;
 	local forward_step = heading == DIR_NE || heading == DIR_SE ? 1 : -1;
@@ -616,7 +623,7 @@ function D4_BuildTwoTurnCenterline(start, goal, company_id, heading, min_run, re
 		if (!D4_AppendAxisTo(path, horizontal ? "x" : "y", bend_value)) continue;
 		if (!D4_AppendMiteredShift(path, horizontal, horizontal ? goal.y : goal.x, forward_step)) continue;
 		if (!D4_AppendAxisTo(path, horizontal ? "x" : "y", horizontal ? goal.x : goal.y)) continue;
-		if (D4_ValidateCenterlineCandidate(path, company_id, heading) && (!require_paired_lane || D4_HasBuildablePairedLane(path, company_id))) return { ok = true, path = path };
+		if (D4_ValidateCenterlineCandidate(path, company_id, heading) && (!require_paired_lane || D4_HasBuildablePairedLane(path, company_id, paired_start, paired_end, paired_start_heading, paired_end_heading))) return { ok = true, path = path };
 	}
 	return { ok = false, error = D4_Error("dogleg_not_found", D4_PointKey(start) + "->" + D4_PointKey(goal)) };
 }
@@ -665,13 +672,13 @@ function D4_ValidateCenterlineCandidate(path, company_id, required_heading) {
 	return true;
 }
 
-function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start_dir = -1, required_goal_dir = -1, max_turns = -1, turn_cost_override = -1, min_turn_run = 0, require_paired_lane = false) {
+function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start_dir = -1, required_goal_dir = -1, max_turns = -1, turn_cost_override = -1, min_turn_run = 0, require_paired_lane = false, paired_start = null, paired_end = null, paired_start_heading = -1, paired_end_heading = -1) {
 	/* Paired RoRo endpoints normally face the same cardinal direction. Test the
 	 * complete bounded family of two-turn doglegs first: unlike generic A*, this
 	 * guarantees enough straight approach at both ends for a parallel mitered
 	 * lane and costs only O(distance squared) test-mode rail probes. */
 	if (min_turn_run > 0 && required_start_dir >= 0 && required_start_dir == required_goal_dir) {
-		local dogleg = D4_BuildTwoTurnCenterline(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane);
+		local dogleg = D4_BuildTwoTurnCenterline(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane, paired_start, paired_end, paired_start_heading, paired_end_heading);
 		if (dogleg.ok) return dogleg;
 		/* Reserve the final straight before generic search. The unconstrained A*
 		 * previously reached the goal with a one-tile corrective miter; routing to
@@ -684,7 +691,7 @@ function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start
 		foreach (point in prefix.path) D4_AppendPointIfNew(combined, point);
 		for (local tail = min_turn_run - 1; tail >= 0; tail--) D4_AppendPointIfNew(combined, D4_Offset(goal, D4_RotateDir(required_goal_dir, 2), tail));
 		if (!D4_ValidateCenterlineCandidate(combined, company_id, required_goal_dir)) return { ok = false, error = D4_Error("approach_extension_unbuildable", D4_PointKey(approach)) };
-		if (require_paired_lane && !D4_HasBuildablePairedLane(combined, company_id)) return { ok = false, error = D4_Error("paired_extension_unbuildable", D4_PointKey(approach)) };
+		if (require_paired_lane && !D4_HasBuildablePairedLane(combined, company_id, paired_start, paired_end, paired_start_heading, paired_end_heading)) return { ok = false, error = D4_Error("paired_extension_unbuildable", D4_PointKey(approach)) };
 		return { ok = true, path = combined };
 	}
 	/* Bounded clean-room A* adapted from the accepted M2 planner. Every

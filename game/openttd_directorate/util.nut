@@ -148,6 +148,24 @@ function D4_GetCompanyBalance(company_id) {
 	return GSCompany.GetBankBalance(company_id);
 }
 
+function D4_CompanySnapshot(company_id) {
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("company_not_found", company_id) };
+	return {
+		ok = true,
+		payload = {
+			scope = "company",
+			company_id = company_id,
+			name = GSCompany.GetName(company_id),
+			bank_balance = GSCompany.GetBankBalance(company_id),
+			loan_amount = GSCompany.GetLoanAmount(),
+			max_loan_amount = GSCompany.GetMaxLoanAmount(),
+			loan_interval = GSCompany.GetLoanInterval(),
+			tick = D4_Tick(),
+		},
+	};
+}
+
 function D4_CanAfford(company_id, reserve, cost_estimate) {
 	local balance = D4_GetCompanyBalance(company_id);
 	if (balance < reserve + cost_estimate) return false;

@@ -122,6 +122,8 @@ class DirectorateM4Bridge {
 	function HandleExecute(payload) {
 		if (!("company_id" in payload) || typeof payload.company_id != "integer") return { ok = false, error = D4_Error("invalid_company", "") };
 		if (!("command" in payload) || typeof payload.command != "string") return { ok = false, error = D4_Error("invalid_command", "") };
+		if (payload.command == "get_game_state") return { ok = true, payload = this.store.GameState() };
+		if (payload.command == "get_company_info" || payload.command == "get_company_finances") return D4_CompanySnapshot(payload.company_id);
 		if (payload.command == "inspect_plan_curves") {
 			if (!("params" in payload) || !D4_IsTable(payload.params) || !("plan_id" in payload.params) || typeof payload.params.plan_id != "string") return { ok = false, error = D4_Error("invalid_curve_inspection", "") };
 			local plan = this.store.GetPlan(payload.params.plan_id);

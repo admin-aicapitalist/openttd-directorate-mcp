@@ -164,6 +164,22 @@ test("Bridge dispatches verify, commissioning, and bounded curve inspection", ()
   assert.match(bridge, /this\.store\.Verify\(payload\.company_id, payload\.operation_id, level, true\)/);
 });
 
+test("Fresh campaigns expose a persistent campaign epoch and authoritative company economics", () => {
+  const bridge = readFileSync(join(gameDir, "bridge.nut"), "utf8");
+  const store = readFileSync(join(gameDir, "plan_store.nut"), "utf8");
+  assert.match(store, /campaign_id = D4_NewUUID\(\)/);
+  assert.match(store, /campaign_started_date = GSDate\.GetCurrentDate\(\)/);
+  assert.match(store, /campaign_id = this\.campaign_id/);
+  assert.match(store, /if \(D4_Has\(data, "campaign_id"\)/);
+  assert.match(store, /scope == "map"/);
+  assert.match(store, /scope == "company"/);
+  assert.match(store, /scope == "economy"/);
+  assert.match(store, /D4_CompanySnapshot\(request\.company_id\)/);
+  assert.match(bridge, /payload\.command == "get_game_state"/);
+  assert.match(bridge, /payload\.command == "get_company_info"/);
+  assert.match(bridge, /payload\.command == "get_company_finances"/);
+});
+
 test("Bridge preserves rich apply evidence on success and failure", () => {
   const bridge = readFileSync(join(gameDir, "bridge.nut"), "utf8");
   assert.match(bridge, /return \{ ok = result\.ok, payload = result, error = D4_Has\(result, "error"\) \? result\.error : null \};/);
@@ -213,8 +229,16 @@ test("Single-shuttle routing uses the real station tiles as endpoint context", (
   const program = readFileSync(join(gameDir, "build_program.nut"), "utf8");
   const store = readFileSync(join(gameDir, "plan_store.nut"), "utf8");
   const version = readFileSync(join(gameDir, "version.nut"), "utf8");
-  assert.match(program, /local source_entry = single_shuttle \? source_station\.op\.point : D4_NearestBlueprintPortPoint/);
-  assert.match(program, /local destination_exit = single_shuttle \? destination_station\.op\.point : D4_NearestBlueprintPortPoint/);
+  const blueprint = readFileSync(join(gameDir, "blueprint.nut"), "utf8");
+  const survey = readFileSync(join(gameDir, "site_survey.nut"), "utf8");
+  assert.match(program, /local bootstrap_curve_run = single_shuttle/);
+  assert.match(program, /single_shuttle \? 4 : -1, single_shuttle \? 50 : -1, bootstrap_curve_run, false/);
+  assert.match(blueprint, /name == "single_shuttle_1xN"/);
+  assert.match(blueprint, /for \(local cell = 0; cell < platform_length; cell\+\+\)/);
+  assert.match(blueprint, /throat = \{ x = 0, y = platform_length \}/);
+  assert.match(survey, /blueprint_overrides\.platform_length/);
+  assert.match(program, /local source_entry = D4_NearestBlueprintPortPoint\(plan\.station_blueprint, "platform_body", start\)/);
+  assert.match(program, /local destination_exit = D4_NearestBlueprintPortPoint\(plan\.destination_blueprint, "platform_body", goal\)/);
   assert.match(program, /D4_AppendLaneOperations\(ops, "outbound", route\.path, source_entry, destination_exit\)/);
   assert.match(program, /local prev = i > 0 \? path\[i - 1\] : \(entry_point != null \? entry_point/);
   assert.match(program, /local next = i \+ 1 < path\.len\(\) \? path\[i \+ 1\] : \(exit_point != null \? exit_point/);
@@ -287,17 +311,21 @@ test("Paired corridor connects through-hub endpoints through common fan and merg
   assert.match(program, /through_hub_source_exit_heading_mismatch/);
   assert.match(program, /through_hub_destination_exit_heading_mismatch/);
   assert.match(program, /source_manifest\.manifest\.loop_exit_heading/);
-  assert.match(program, /dest_manifest\.manifest\.fan_entry_heading, 4, 50, turn_clearance, true\)/);
+  assert.match(program, /dest_manifest\.manifest\.fan_entry_heading, 4, 50, turn_clearance, true, dest_out, source_in, dest_manifest\.manifest\.loop_exit_heading, source_manifest\.manifest\.fan_entry_heading\)/);
   assert.match(program, /local turn_clearance = source_manifest\.manifest\.platform_length/);
   assert.match(program, /maximum consist envelope/);
   assert.match(program, /if \(!outbound\.ok && turn_clearance > 3\)/);
-  assert.match(program, /fan_entry_heading, 4, 50, 3, true\)/);
+  assert.match(program, /fan_entry_heading, 4, 50, 3, true, dest_out, source_in/);
   assert.match(program, /curve_clearance_relaxed = curve_clearance_relaxed/);
-  assert.match(program, /function D4_HasBuildablePairedLane/);
+  assert.match(program, /function D4_HasBuildablePairedLane\(path, company_id, expected_start = null, expected_end = null/);
+  assert.match(program, /expected_start != null && D4_PointKey\(candidate\.return_lane\[0\]\) != D4_PointKey\(expected_start\)/);
+  assert.match(program, /expected_end != null && D4_PointKey\(candidate\.return_lane\[candidate\.return_lane\.len\(\) - 1\]\) != D4_PointKey\(expected_end\)/);
+  assert.match(program, /expected_start_heading >= 0 && start_heading != expected_start_heading/);
+  assert.match(program, /expected_end_heading >= 0 && end_heading != expected_end_heading/);
   assert.match(program, /function D4_BuildTwoTurnCenterline/);
   assert.match(program, /function D4_AppendMiteredShift/);
   assert.match(program, /A pure cross-axis run between forward runs draws a slowing 90/);
-  assert.match(program, /D4_BuildTwoTurnCenterline\(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane\)/);
+  assert.match(program, /D4_BuildTwoTurnCenterline\(start, goal, company_id, required_start_dir, min_turn_run, require_paired_lane, paired_start, paired_end, paired_start_heading, paired_end_heading\)/);
   assert.match(program, /local approach = D4_Offset\(goal, D4_RotateDir\(required_goal_dir, 2\), min_turn_run\)/);
   assert.match(program, /local prefix = D4_BuildLegalCenterline\(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, 0, false\)/);
   assert.match(program, /function D4_ValidateCenterlineCandidate/);
@@ -312,6 +340,8 @@ test("Paired corridor connects through-hub endpoints through common fan and merg
   assert.match(program, /function D4_SelectBestSitePair\(source_candidates, destination_candidates, excluded = null\)/);
   assert.match(program, /pair_key in excluded/);
   assert.match(program, /source_layout\.loop_exit_heading != source_to_destination/);
+  assert.match(program, /if \(!paired_ports\) continue/);
+  assert.doesNotMatch(program, /if \(!paired_ports\) orientation_penalty/);
   assert.match(program, /function D4_VerifyThroughHubEndpointTopology/);
   assert.match(program, /function D4_IsSafeThroughHubTopology/);
   assert.match(program, /function D4_IsSafeSignalManifest/);

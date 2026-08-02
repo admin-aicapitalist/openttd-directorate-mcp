@@ -40,7 +40,9 @@ function D4_SurveyStationSites(company_id, industry_id, role, blueprint_name, in
 			local origin = { x = industry_location.x + dx, y = industry_location.y + dy };
 			if (!D4_IsPointOnMap(origin)) continue;
 			for (local rotation = 0; rotation < 4; rotation++) {
-				local bp = D4_BuildBlueprint(blueprint_name, rotation, origin, {});
+				local blueprint_overrides = {};
+				if (blueprint_name == "single_shuttle_1xN") blueprint_overrides.platform_length <- D4_ClampInt(D4_Has(policy, "platform_length") ? policy.platform_length : 1, 1, 1, 7);
+				local bp = D4_BuildBlueprint(blueprint_name, rotation, origin, blueprint_overrides);
 				if (!bp.ok) continue;
 				local result = D4_EvaluateSite(company_id, industry_id, industry_location, bp, spread, catchment_tiles);
 				if (result.ok) {
