@@ -164,7 +164,12 @@ class DirectorateM4Bridge {
 			if (!("params" in payload) || !D4_IsTable(payload.params) || !("industry_id" in payload.params) || !("template" in payload.params)) return { ok = false, error = D4_Error("invalid_survey", "") };
 			local policy = D4_Has(payload.params, "policy") && D4_IsTable(payload.params.policy) ? payload.params.policy : {};
 			local role = D4_Has(payload.params, "role") ? payload.params.role : "source";
-			return D4_SurveyStationSites(payload.company_id, payload.params.industry_id, role, payload.params.template, {}, policy);
+			local result = D4_SurveyStationSites(payload.company_id, payload.params.industry_id, role, payload.params.template, {}, policy);
+			/* D4_SurveyStationSites returns its fields flat (ok, candidates, ...),
+			 * not nested under "payload"; Dispatch() defaults any result missing a
+			 * "payload" key to {}, which silently discarded every candidate this
+			 * debug command was meant to expose. Wrap it like the other commands. */
+			return { ok = result.ok, payload = result, error = D4_Has(result, "error") ? result.error : null };
 		}
 		return { ok = false, error = D4_Error("unknown_command", payload.command) };
 	}

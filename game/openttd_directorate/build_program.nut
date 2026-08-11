@@ -84,6 +84,8 @@ function D4_CompileBuildProgram(plan) {
 		if (outbound_signals < 2 || return_signals < 2) return { ok = false, error = D4_Error("program_signal_spacing_unusable", outbound_signals.tostring() + ":" + return_signals.tostring()) };
 	}
 
+	local landscaping = D4_PrependBoundedLandscaping(ops, plan.company_id);
+	if (!landscaping.ok) return landscaping;
 	local validation = D4_ValidateBuildProgram(ops);
 	if (!validation.ok) return validation;
 	return {
@@ -141,8 +143,14 @@ function D4_CompileThroughHubRoroProgram(plan, source_station, destination_stati
 	if (!dest_manifest.ok) return dest_manifest;
 	local source_to_dest = D4_DominantDirection(source_out, dest_in);
 	local dest_to_source = D4_DominantDirection(dest_out, source_in);
-	if (source_manifest.manifest.loop_exit_heading != source_to_dest) return { ok = false, error = D4_Error("through_hub_source_exit_heading_mismatch", D4_DirName(source_manifest.manifest.loop_exit_heading) + ":" + D4_DirName(source_to_dest)) };
-	if (dest_manifest.manifest.loop_exit_heading != dest_to_source) return { ok = false, error = D4_Error("through_hub_destination_exit_heading_mismatch", D4_DirName(dest_manifest.manifest.loop_exit_heading) + ":" + D4_DirName(dest_to_source)) };
+	/* Mirrors D4_SelectBestSitePair's admissible-heading rule (which already
+	 * chose this pair under that same rule): only an exact U-turn at the
+	 * throat is unbuildable. A perpendicular exit is legal -- the corridor
+	 * below runs the endpoint's bounded turn-clearance distance straight
+	 * before mitering toward the dominant direction, the same bounded-turn
+	 * centerline search used for any other start/goal heading mismatch. */
+	if (source_manifest.manifest.loop_exit_heading == D4_RotateDir(source_to_dest, 2)) return { ok = false, error = D4_Error("through_hub_source_exit_heading_mismatch", D4_DirName(source_manifest.manifest.loop_exit_heading) + ":" + D4_DirName(source_to_dest)) };
+	if (dest_manifest.manifest.loop_exit_heading == D4_RotateDir(dest_to_source, 2)) return { ok = false, error = D4_Error("through_hub_destination_exit_heading_mismatch", D4_DirName(dest_manifest.manifest.loop_exit_heading) + ":" + D4_DirName(dest_to_source)) };
 	/* The platform length is the maximum consist envelope for this route. Keep
 	 * every pair of mainline 45-degree transitions at least that far apart so a
 	 * full-length train cannot occupy both curve primitives simultaneously. */
@@ -173,7 +181,7 @@ function D4_CompileThroughHubRoroProgram(plan, source_station, destination_stati
 		local end_heading = D4_DirectionBetween(candidate.return_lane[candidate.return_lane.len() - 2], candidate.return_lane[candidate.return_lane.len() - 1]);
 		local start_heading_ok = start_heading == dest_manifest.manifest.loop_exit_heading;
 		local end_heading_ok = end_heading == source_manifest.manifest.fan_entry_heading;
-		local rail_buildable = D4_ValidateCenterlineCandidate(candidate.return_lane, plan.company_id, dest_manifest.manifest.loop_exit_heading);
+		local rail_buildable = D4_ValidateCenterlineCandidate(candidate.return_lane, plan.company_id, dest_manifest.manifest.loop_exit_heading, source_manifest.manifest.fan_entry_heading);
 		lane_diagnostics += "side=" + side_turns + ":" + D4_PointKey(candidate.return_lane[0]) + ">" + D4_PointKey(candidate.return_lane[candidate.return_lane.len() - 1]) + ":h=" + start_heading + ">" + end_heading + ":rail=" + rail_buildable + ";";
 		if (start_ok && end_ok && start_heading_ok && end_heading_ok && rail_buildable) { returned = candidate; break; }
 	}
@@ -213,6 +221,8 @@ function D4_CompileThroughHubRoroProgram(plan, source_station, destination_stati
 		if (outbound.path.len() >= signal_spacing + 3 && outbound_signals < 1) return { ok = false, error = D4_Error("program_signal_spacing_unusable", "outbound") };
 		if (returned.return_lane.len() >= signal_spacing + 3 && return_signals < 1) return { ok = false, error = D4_Error("program_signal_spacing_unusable", "return") };
 	}
+	local landscaping = D4_PrependBoundedLandscaping(ops, plan.company_id);
+	if (!landscaping.ok) return landscaping;
 	local validation = D4_ValidateBuildProgram(ops);
 	if (!validation.ok) return validation;
 	local topology = {
@@ -512,20 +522,41 @@ function D4_SelectBestSitePair(source_candidates, destination_candidates, exclud
 			if (source_out < 0 || destination_out < 0 || source_to_destination < 0 || destination_to_source < 0) continue;
 			local source_layout = null;
 			local destination_layout = null;
+			local distance = abs(destination_throat.x - source_throat.x) + abs(destination_throat.y - source_throat.y);
+			local orientation_penalty = 0;
 			if (through_pair) {
 				source_layout = D4_DeriveThroughHubEndpointLayout(source.blueprint);
 				destination_layout = D4_DeriveThroughHubEndpointLayout(destination.blueprint);
 				if (!source_layout.ok || !destination_layout.ok) continue;
-				if (source_layout.loop_exit_heading != source_to_destination) continue;
-				if (destination_layout.loop_exit_heading != destination_to_source) continue;
-			}
-			local distance = abs(destination_throat.x - source_throat.x) + abs(destination_throat.y - source_throat.y);
-			local orientation_penalty = 0;
-			if (through_pair) {
+				/* A through-hub loop cannot depart back into itself: an exit heading
+				 * exactly opposite the corridor's travel direction demands an
+				 * immediate reversal at the throat, which is never buildable and is
+				 * rejected outright. A perpendicular exit is legal geometry -- the
+				 * corridor runs straight for the endpoint's bounded turn-clearance
+				 * distance and then miters toward the dominant direction, exactly
+				 * like the bounded-turn search fallback D4_BuildLegalCenterline
+				 * already uses for any other start/goal heading mismatch -- so admit
+				 * it with a penalty instead of a hard rejection. This keeps a direct
+				 * dominant-heading pair preferred whenever the survey found one, but
+				 * lets a map-edge-constrained site (which may only ever expose
+				 * perpendicular rotations) still produce a route. */
+				if (source_layout.loop_exit_heading == D4_RotateDir(source_to_destination, 2)) continue;
+				if (destination_layout.loop_exit_heading == D4_RotateDir(destination_to_source, 2)) continue;
+				if (source_layout.loop_exit_heading != source_to_destination) orientation_penalty += 100000;
+				if (destination_layout.loop_exit_heading != destination_to_source) orientation_penalty += 100000;
+				/* The fan/merge geometry's physical port offset from the throat is a
+				 * fixed property of the endpoint's own layout (its loop_exit_heading
+				 * for the outbound side, its fan_entry_heading for the inbound side),
+				 * not of the travel direction toward the other site. Anchoring this
+				 * check to source_to_destination/destination_to_source only ever
+				 * happened to hold when the exact-heading gate above also held; key
+				 * it off each endpoint's own heading so the invariant stays correct
+				 * once a perpendicular departure is admitted. */
 				local paired_ports = false;
 				foreach (side_turns in [1, 3]) {
-					local side = D4_RotateDir(source_to_destination, side_turns);
-					if (D4_PointKey(D4_Offset(source_throat, side, 1)) == D4_PointKey(source_platform) && D4_PointKey(D4_Offset(destination_throat, side, 1)) == D4_PointKey(destination_platform)) paired_ports = true;
+					local source_side = D4_RotateDir(source_layout.loop_exit_heading, side_turns);
+					local destination_side = D4_RotateDir(destination_layout.fan_entry_heading, side_turns);
+					if (D4_PointKey(D4_Offset(source_throat, source_side, 1)) == D4_PointKey(source_platform) && D4_PointKey(D4_Offset(destination_throat, destination_side, 1)) == D4_PointKey(destination_platform)) paired_ports = true;
 				}
 				if (!paired_ports) continue;
 			} else {
@@ -600,8 +631,9 @@ function D4_HasBuildablePairedLane(path, company_id, expected_start = null, expe
 		if (expected_end != null && D4_PointKey(candidate.return_lane[candidate.return_lane.len() - 1]) != D4_PointKey(expected_end)) continue;
 		if (expected_start_heading >= 0 && start_heading != expected_start_heading) continue;
 		if (expected_end_heading >= 0 && end_heading != expected_end_heading) continue;
-		local validation_heading = expected_start_heading >= 0 ? expected_start_heading : start_heading;
-		if (validation_heading >= 0 && D4_ValidateCenterlineCandidate(candidate.return_lane, company_id, validation_heading)) return true;
+		local validation_start_heading = expected_start_heading >= 0 ? expected_start_heading : start_heading;
+		local validation_end_heading = expected_end_heading >= 0 ? expected_end_heading : end_heading;
+		if (validation_start_heading >= 0 && D4_ValidateCenterlineCandidate(candidate.return_lane, company_id, validation_start_heading, validation_end_heading)) return true;
 	}
 	return false;
 }
@@ -661,12 +693,21 @@ function D4_AppendAxisTo(path, axis, target) {
 	return (axis == "x" ? path[path.len() - 1].x : path[path.len() - 1].y) == target;
 }
 
-function D4_ValidateCenterlineCandidate(path, company_id, required_heading) {
+/* required_end_heading defaults to required_start_heading: every caller
+ * except a through-hub return lane builds a route whose start and goal
+ * heading are the same value by construction (D4_BuildTwoTurnCenterline's
+ * dogleg is only ever invoked when required_start_dir == required_goal_dir).
+ * A through-hub return lane is the one case where the two legitimately
+ * differ -- it departs the destination at the destination's loop_exit_heading
+ * and arrives at the source at the source's fan_entry_heading, which are
+ * independent endpoint properties, not the same travel direction repeated. */
+function D4_ValidateCenterlineCandidate(path, company_id, required_start_heading, required_end_heading = -1) {
+	if (required_end_heading < 0) required_end_heading = required_start_heading;
 	if (!D4_IsArray(path) || path.len() < 2) return false;
-	if (D4_DirectionBetween(path[0], path[1]) != required_heading || D4_DirectionBetween(path[path.len() - 2], path[path.len() - 1]) != required_heading) return false;
+	if (D4_DirectionBetween(path[0], path[1]) != required_start_heading || D4_DirectionBetween(path[path.len() - 2], path[path.len() - 1]) != required_end_heading) return false;
 	for (local i = 0; i < path.len(); i++) {
-		local prev = i > 0 ? path[i - 1] : D4_Offset(path[i], D4_RotateDir(required_heading, 2), 1);
-		local next = i + 1 < path.len() ? path[i + 1] : D4_Offset(path[i], required_heading, 1);
+		local prev = i > 0 ? path[i - 1] : D4_Offset(path[i], D4_RotateDir(required_start_heading, 2), 1);
+		local next = i + 1 < path.len() ? path[i + 1] : D4_Offset(path[i], required_end_heading, 1);
 		if (!D4_IsPointOnMap(prev) || !D4_IsPointOnMap(next) || !D4_IsLegalPrimitive(prev, path[i], next) || !D4_TestProgramRailPiece(prev, path[i], next, company_id)) return false;
 	}
 	return true;
@@ -704,16 +745,17 @@ function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start
 		 * previously reached the goal with a one-tile corrective miter; routing to
 		 * a shifted approach point makes the required terminal run structural. */
 		local approach = D4_Offset(goal, D4_RotateDir(required_goal_dir, 2), min_turn_run);
-		if (!D4_IsPointOnMap(approach)) return { ok = false, error = D4_Error("curve_run_approach_out_of_map", D4_PointKey(approach)) };
-		local prefix = D4_BuildLegalCenterline(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, min_turn_run, false);
-		if (!prefix.ok) return prefix;
-		local combined = [];
-		foreach (point in prefix.path) D4_AppendPointIfNew(combined, point);
-		for (local tail = min_turn_run - 1; tail >= 0; tail--) D4_AppendPointIfNew(combined, D4_Offset(goal, D4_RotateDir(required_goal_dir, 2), tail));
-		if (!D4_HasMinimumCurveRun(combined, min_turn_run)) return { ok = false, error = D4_Error("approach_extension_curve_run", D4_PointKey(approach)) };
-		if (!D4_ValidateCenterlineCandidate(combined, company_id, required_goal_dir)) return { ok = false, error = D4_Error("approach_extension_unbuildable", D4_PointKey(approach)) };
-		if (require_paired_lane && !D4_HasBuildablePairedLane(combined, company_id, paired_start, paired_end, paired_start_heading, paired_end_heading)) return { ok = false, error = D4_Error("paired_extension_unbuildable", D4_PointKey(approach)) };
-		return { ok = true, path = combined };
+		/* Fast approach extension is an optimisation only. Map-edge endpoints and
+		 * rejected prefixes must fall through to the bounded A* below. */
+		if (D4_IsPointOnMap(approach)) {
+			local prefix = D4_BuildLegalCenterline(start, approach, company_id, policy, required_start_dir, required_goal_dir, max_turns, turn_cost_override, min_turn_run, false);
+			if (prefix.ok) {
+				local combined = [];
+				foreach (point in prefix.path) D4_AppendPointIfNew(combined, point);
+				for (local tail = min_turn_run - 1; tail >= 0; tail--) D4_AppendPointIfNew(combined, D4_Offset(goal, D4_RotateDir(required_goal_dir, 2), tail));
+				if (D4_HasMinimumCurveRun(combined, min_turn_run) && D4_ValidateCenterlineCandidate(combined, company_id, required_goal_dir) && (!require_paired_lane || D4_HasBuildablePairedLane(combined, company_id, paired_start, paired_end, paired_start_heading, paired_end_heading))) return { ok = true, path = combined };
+			}
+		}
 	}
 	/* Bounded clean-room A* adapted from the accepted M2 planner. Every
 	 * candidate primitive is tested by OpenTTD; no client-supplied path is
@@ -955,6 +997,336 @@ function D4_DepotOperation(path, occupied = null, prefer_tail = false, access_mo
 	return { ok = false };
 }
 
+/* Landscaping is deliberately a build-program operation, not a planner side effect.
+ * A* centreline rail is accepted only after D4_TestProgramRailPiece has already
+ * proved its exact primitive buildable in GSTestMode. Never terraform it. Through-
+ * hub fan/merge/loop/turnback and depot-access primitives are geometrically emitted
+ * after that search, so they get the same narrow escape hatch as station/depot pads:
+ * only a failed exact GSTestMode primitive can nominate its own prev/tile/next box. */
+function D4_IsLandscapeEligibleGeometricRail(op) {
+	if (!D4_IsTable(op) || op.kind != "rail_connection" || !D4_Has(op, "op_id")) return false;
+	local id = op.op_id;
+	return id.find(".fan.") != null || id.find(".merge.") != null || id.find(".loop.") != null || id.find(".turnback.") != null || id.find("rail.depot_access.") == 0;
+}
+
+function D4_GeometricRailRectangle(op) {
+	if (!D4_IsLandscapeEligibleGeometricRail(op)) return null;
+	local a = D4_FromTile(op.prev), b = D4_FromTile(op.tile), c = D4_FromTile(op.next);
+	local minx = a.x; if (b.x < minx) minx = b.x; if (c.x < minx) minx = c.x;
+	local maxx = a.x; if (b.x > maxx) maxx = b.x; if (c.x > maxx) maxx = c.x;
+	local miny = a.y; if (b.y < miny) miny = b.y; if (c.y < miny) miny = c.y;
+	local maxy = a.y; if (b.y > maxy) maxy = b.y; if (c.y > maxy) maxy = c.y;
+	/* CmdLevelLand operates on north-corner vertices, not complete tile
+	 * footprints. Include the east/south boundary vertices so every corner of
+	 * prev/tile/next is level; otherwise a boundary rail tile can retain a
+	 * compound slope even though all directly selected north vertices match. */
+	local end_point = { x = maxx + 1, y = maxy + 1 };
+	if (!D4_IsPointOnMap(end_point)) return null;
+	return { start = D4_ToTile({ x = minx, y = miny }), end = D4_ToTile(end_point), ids = [op.op_id] };
+}
+
+function D4_CompleteTileLandscapeRectangle(start, end, ids) {
+	local a = D4_FromTile(start), b = D4_FromTile(end);
+	local minx = a.x < b.x ? a.x : b.x, maxx = a.x > b.x ? a.x : b.x;
+	local miny = a.y < b.y ? a.y : b.y, maxy = a.y > b.y ? a.y : b.y;
+	local end_point = { x = maxx + 1, y = maxy + 1 };
+	if (!D4_IsPointOnMap(end_point)) return null;
+	return { start = D4_ToTile({ x = minx, y = miny }), end = D4_ToTile(end_point), ids = ids };
+}
+
+/* Merge only overlapping inner rectangles. Adjacent primitives retain separate
+ * envelopes: sharing a halo is not evidence that flattening their union is needed. */
+function D4_MergeLandscapeRectangle(rectangles, candidate, company_id) {
+	local ca = D4_FromTile(candidate.start), cb = D4_FromTile(candidate.end);
+	foreach (existing in rectangles) {
+		local ea = D4_FromTile(existing.start), eb = D4_FromTile(existing.end);
+		if (cb.x < ea.x || eb.x < ca.x || cb.y < ea.y || eb.y < ca.y) continue;
+		local minx = ca.x < ea.x ? ca.x : ea.x, maxx = cb.x > eb.x ? cb.x : eb.x;
+		local miny = ca.y < ea.y ? ca.y : ea.y, maxy = cb.y > eb.y ? cb.y : eb.y;
+		if ((maxx - minx + 1) * (maxy - miny + 1) > DIRECTORATE_M4_MAX_LANDSCAPE_RECTANGLE_AREA) continue;
+		local merge_safe = true;
+		for (local y = miny; y <= maxy && merge_safe; y++) for (local x = minx; x <= maxx; x++) {
+			local point = { x=x, y=y };
+			if (!D4_IsPointOnMap(point) || !D4_LandscapeTileSafe(D4_ToTile(point), company_id)) { merge_safe = false; break; }
+		}
+		if (!merge_safe) continue;
+		existing.start = D4_ToTile({ x = minx, y = miny }); existing.end = D4_ToTile({ x = maxx, y = maxy });
+		foreach (id in candidate.ids) existing.ids.append(id);
+		if (D4_Has(candidate, "force_after_predecessor") && candidate.force_after_predecessor) existing.force_after_predecessor <- true;
+		return;
+	}
+	rectangles.append(candidate);
+}
+
+function D4_PrependBoundedLandscaping(ops, company_id) {
+	local rectangles = [], geometric_seed_rectangles = [], seen = {};
+	foreach (op in ops) {
+		local candidate = null;
+		if (op.kind == "station_rect" || op.kind == "depot") {
+			if (D4_StationOrDepotAlreadyBuildable(op, company_id)) continue;
+			candidate = D4_CompleteTileLandscapeRectangle(op.tile, op.kind == "station_rect" ? op.end_tile : op.tile, [op.op_id]);
+		} else if (D4_IsLandscapeEligibleGeometricRail(op)) {
+			/* Do not turn an ownership/water/industry/houses conflict into terrain.
+			 * The exact failed rail probe is necessary but insufficient; every halo
+			 * tile must still pass the immutable occupancy guard below. */
+			if (D4_RailConnectionAlreadyBuildable(op, company_id)) continue;
+			candidate = D4_GeometricRailRectangle(op);
+			if (candidate == null) continue;
+			geometric_seed_rectangles.append({ start = candidate.start, end = candidate.end });
+		}
+		if (candidate == null) continue;
+		local key = candidate.start + ":" + candidate.end;
+		if (key in seen) continue; seen[key] <- true;
+		D4_MergeLandscapeRectangle(rectangles, candidate, company_id);
+	}
+	GSLog.Info("D4 landscaping seeds=" + geometric_seed_rectangles.len() + " initial_rectangles=" + rectangles.len());
+	/* A merged seed rectangle can alter slopes on branch primitives sharing its
+	 * boundary vertices. Follow the endpoint-only geometric closure to a fixed
+	 * point; strict rectangle, aggregate tile, operation, height, and cost caps
+	 * prevent this from escaping into either intercity corridor. */
+	local closure_frontier = geometric_seed_rectangles;
+	for (local closure_depth = 0; closure_depth < 32 && closure_frontier.len() > 0; closure_depth++) {
+		local next_frontier = [];
+		foreach (op in ops) {
+			if (!D4_IsLandscapeEligibleGeometricRail(op) || !D4_RailOperationTouchesLandscapeRectangles(op, closure_frontier)) continue;
+			local candidate = D4_GeometricRailRectangle(op);
+			if (candidate == null) continue;
+			local key = candidate.start + ":" + candidate.end;
+			if (key in seen) continue;
+			seen[key] <- true;
+			D4_MergeLandscapeRectangle(rectangles, candidate, company_id);
+			next_frontier.append({ start = candidate.start, end = candidate.end });
+		}
+		closure_frontier = next_frontier;
+	}
+	/* Endpoint earthworks can invalidate a station/depot that was buildable on
+	 * the original slope. If its complete tile footprint overlaps the geometric
+	 * closure, make that asset part of the same levelled terminal envelope. */
+	foreach (asset_op in ops) {
+		if (asset_op.kind != "station_rect" && asset_op.kind != "depot") continue;
+		local asset_rect = D4_CompleteTileLandscapeRectangle(asset_op.tile, asset_op.kind == "station_rect" ? asset_op.end_tile : asset_op.tile, [asset_op.op_id]);
+		if (asset_rect == null || !D4_LandscapeRectangleTouchesAny(asset_rect, rectangles)) continue;
+		asset_rect.force_after_predecessor <- true;
+		local asset_key = asset_rect.start + ":" + asset_rect.end;
+		if (asset_key in seen) continue;
+		seen[asset_key] <- true;
+		D4_MergeLandscapeRectangle(rectangles, asset_rect, company_id);
+	}
+	GSLog.Info("D4 landscaping closure_rectangles=" + rectangles.len());
+	local land = [], total_tiles = 0, total_cost = 0;
+	foreach (rect in rectangles) {
+		/* CmdLevelLand uses TileHeight(start), i.e. the start tile's north vertex,
+		 * as its target. The same rectangle can therefore be levelled from any of
+		 * its four corner vertices. Pick the bounded orientation whose one-tile
+		 * boundary is already within one level of the target. This prevents the
+		 * command's recursive slope repair from escaping the snapshotted halo; in
+		 * particular, prefer lowering an isolated two-level bump over raising its
+		 * surrounding natural terrain. */
+		local oriented = D4_SelectLandscapeOrientation(rect);
+		if (!oriented.ok) return oriented;
+		rect.start = oriented.start; rect.end = oriented.end;
+		local before = oriented.snapshot;
+		if (before.flat && !(D4_Has(rect, "force_after_predecessor") && rect.force_after_predecessor)) continue;
+		local key = rect.start + ":" + rect.end;
+		if (before.area > DIRECTORATE_M4_MAX_LANDSCAPE_RECTANGLE_AREA || before.max_delta > DIRECTORATE_M4_MAX_LANDSCAPE_HEIGHT_DELTA) return { ok = false, error = D4_Error("landscape_policy_cap", key) };
+		local unsafe_tile = D4_LandscapeUnsafeOwnedTile(before, company_id);
+		if (unsafe_tile != null) return { ok = false, error = D4_Error("landscape_immutable_occupancy", unsafe_tile.tostring()) };
+		total_tiles += before.area;
+		local estimate = D4_LandscapeEstimate(before.area, before.max_delta < 1 ? 1 : before.max_delta);
+		if (!before.flat) {
+			local estimate_probe = D4_LandscapeTestEstimate(rect.start, rect.end, company_id);
+			if (!estimate_probe.ok) return { ok = false, error = D4_Error("landscape_test_estimate_failed", key) };
+			if (estimate_probe.cost > estimate) estimate = estimate_probe.cost;
+		}
+		total_cost += estimate;
+		if (land.len() + 1 > DIRECTORATE_M4_MAX_LANDSCAPE_OPERATIONS || total_tiles > DIRECTORATE_M4_MAX_LANDSCAPE_TILES || total_cost > DIRECTORATE_M4_MAX_LANDSCAPE_COST) return { ok = false, error = D4_Error("landscape_program_cap", key) };
+		local suffix = rect.ids.len() == 1 ? rect.ids[0] : rect.ids[0] + ".merged." + rect.ids.len();
+		land.append({ op_id = "landscape." + suffix, kind = "level_tiles", tile = rect.start, end_tile = rect.end, target_height = before.target, maximum_tiles = before.area, maximum_height_delta = before.max_delta, affected_halo = before.halo, before = before.corners, fingerprint = D4_BoundedFingerprint(before.corners), estimated_cost = estimate });
+	}
+	for (local i = land.len() - 1; i >= 0; i--) ops.insert(0, land[i]);
+	return { ok = true, count = land.len(), cost = total_cost };
+}
+
+function D4_SelectLandscapeOrientation(rect) {
+	local a = D4_FromTile(rect.start), b = D4_FromTile(rect.end);
+	local minx = a.x < b.x ? a.x : b.x, maxx = a.x > b.x ? a.x : b.x;
+	local miny = a.y < b.y ? a.y : b.y, maxy = a.y > b.y ? a.y : b.y;
+	local base = D4_LandscapeSnapshot(rect.start, rect.end);
+	if (!base.ok) return base;
+	local pairs = [
+		[{ x=minx, y=miny }, { x=maxx, y=maxy }],
+		[{ x=maxx, y=maxy }, { x=minx, y=miny }],
+		[{ x=minx, y=maxy }, { x=maxx, y=miny }],
+		[{ x=maxx, y=miny }, { x=minx, y=maxy }],
+	];
+	local best = null, seen = {};
+	foreach (pair in pairs) {
+		local start = D4_ToTile(pair[0]), end = D4_ToTile(pair[1]), key = start + ":" + end;
+		if (key in seen) continue; seen[key] <- true;
+		/* Geometry, ownership masks, and before heights are orientation-invariant.
+		 * Read them once above; only CmdLevelLand's target vertex changes. */
+		local target = GSTile.GetCornerHeight(start, GSTile.CORNER_N);
+		local max_delta = 0, flat = true, boundary_ok = true, boundary_delta = 0;
+		foreach (record in base.corners) for (local i = 0; i < 4; i++) {
+			local delta = abs(record.h[i] - target);
+			if (record.owned[i]) {
+				if (delta > max_delta) max_delta = delta;
+				if (delta != 0) flat = false;
+			} else {
+				if (delta > boundary_delta) boundary_delta = delta;
+				if (delta > 1) boundary_ok = false;
+			}
+		}
+		if (!boundary_ok || max_delta > DIRECTORATE_M4_MAX_LANDSCAPE_HEIGHT_DELTA) continue;
+		local score = max_delta * 16 + boundary_delta;
+		local snapshot = { ok=true, halo=base.halo, corners=base.corners, target=target, max_delta=max_delta, flat=flat, area=base.area };
+		if (best == null || score < best.score || (score == best.score && start < best.start)) best = { ok=true, start=start, end=end, snapshot=snapshot, score=score };
+	}
+	if (best == null) return { ok=false, error=D4_Error("landscape_boundary_unbounded", rect.start + ":" + rect.end) };
+	return best;
+}
+
+function D4_StationOrDepotAlreadyBuildable(op, company_id) {
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid() || !D4_SelectRailType()) return false;
+	local tm = GSTestMode();
+	if (op.kind == "station_rect") return GSRail.BuildRailStation(op.tile, op.direction, op.num_platforms, op.platform_length, op.destination_station);
+	if (op.kind == "depot") return GSRail.BuildRailDepot(op.tile, op.front);
+	return false;
+}
+
+function D4_RailConnectionAlreadyBuildable(op, company_id) {
+	if (!D4_IsLandscapeEligibleGeometricRail(op)) return false;
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid() || !D4_SelectRailType()) return false;
+	local tm = GSTestMode();
+	return GSRail.BuildRail(op.prev, op.tile, op.next);
+}
+
+function D4_TileInsideLandscapeRectangles(tile, rectangles) {
+	local p = D4_FromTile(tile);
+	foreach (rect in rectangles) {
+		local a = D4_FromTile(rect.start), b = D4_FromTile(rect.end);
+		local minx = a.x < b.x ? a.x : b.x, maxx = a.x > b.x ? a.x : b.x;
+		local miny = a.y < b.y ? a.y : b.y, maxy = a.y > b.y ? a.y : b.y;
+		if (p.x >= minx && p.x <= maxx && p.y >= miny && p.y <= maxy) return true;
+	}
+	return false;
+}
+
+function D4_RailOperationTouchesLandscapeRectangles(op, rectangles) {
+	return D4_TileInsideLandscapeRectangles(op.prev, rectangles) || D4_TileInsideLandscapeRectangles(op.tile, rectangles) || D4_TileInsideLandscapeRectangles(op.next, rectangles);
+}
+
+function D4_LandscapeRectangleTouchesAny(candidate, rectangles) {
+	local ca = D4_FromTile(candidate.start), cb = D4_FromTile(candidate.end);
+	local cminx = ca.x < cb.x ? ca.x : cb.x, cmaxx = ca.x > cb.x ? ca.x : cb.x;
+	local cminy = ca.y < cb.y ? ca.y : cb.y, cmaxy = ca.y > cb.y ? ca.y : cb.y;
+	foreach (rect in rectangles) {
+		local a = D4_FromTile(rect.start), b = D4_FromTile(rect.end);
+		local minx = a.x < b.x ? a.x : b.x, maxx = a.x > b.x ? a.x : b.x;
+		local miny = a.y < b.y ? a.y : b.y, maxy = a.y > b.y ? a.y : b.y;
+		if (!(cmaxx < minx || maxx < cminx || cmaxy < miny || maxy < cminy)) return true;
+	}
+	return false;
+}
+
+function D4_LandscapeEstimate(area, delta) { return GSTile.GetBuildCost(GSTile.BT_TERRAFORM) * area * (delta < 1 ? 1 : delta); }
+function D4_LandscapeTestEstimate(start, end, company_id) {
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid()) return { ok = false, cost = 0 };
+	local accounting = GSAccounting();
+	local tm = GSTestMode();
+	if (!GSTile.LevelTiles(start, end)) return { ok = false, cost = accounting.GetCosts() };
+	local cost = accounting.GetCosts(); if (cost < 0) cost = -cost;
+	return { ok = true, cost = cost };
+}
+function D4_LandscapeTileSafe(tile, company_id) { return GSMap.IsValidTile(tile) && !D4_IsTileWater(tile) && GSTile.GetOwner(tile) == GSCompany.COMPANY_INVALID && GSTile.IsBuildable(tile); }
+function D4_LandscapeUnsafeOwnedTile(snapshot, company_id) {
+	foreach (record in snapshot.corners) {
+		local owns_corner = false;
+		foreach (owned in record.owned) if (owned) { owns_corner = true; break; }
+		if (owns_corner && !D4_LandscapeTileSafe(record.tile, company_id)) return record.tile;
+	}
+	return null;
+}
+
+/* The set of every tile touched by any pending landscape op's inner rectangle or
+ * its one-tile halo. Used only to decide which non-landscape ops must defer their
+ * preflight buildability probe to commit time (see D4_OpTouchesFootprint). */
+function D4_LandscapeFootprintSet(ops) {
+	local set = {};
+	foreach (op in ops) {
+		if (op.kind != "level_tiles") continue;
+		foreach (tile in op.affected_halo) set[tile] <- true;
+	}
+	return set;
+}
+
+/* GSTestMode probes do not see the effect of an earlier GSTestMode probe in the
+ * same preflight pass (the existing untested-rail-then-signal case below already
+ * relies on this), so a station/depot/rail op whose tile touches a pending
+ * landscape footprint cannot be honestly test-mode-verified here: the ground it
+ * would be tested against has not actually been levelled yet. Defer those ops to
+ * commit's authoritative real build + readback instead of failing preflight on
+ * terrain that is about to change. */
+function D4_OpTouchesFootprint(op, footprint) {
+	if (op.kind == "station_rect") return (op.tile in footprint) || (op.end_tile in footprint);
+	if (op.kind == "rail_connection") return (op.tile in footprint) || (op.prev in footprint) || (op.next in footprint);
+	if (op.kind == "depot") return (op.tile in footprint) || (op.front in footprint);
+	return false;
+}
+
+function D4_ConservativeOperationCost(op) {
+	if (op.kind == "station_rect") return GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_STATION);
+	if (op.kind == "rail_connection") return GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_TRACK);
+	if (op.kind == "depot") return GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_DEPOT);
+	return 0;
+}
+
+/* Corner ownership is physical, not tile-wide. A halo tile can share one or two
+ * corners with an inner tile; LevelTiles is allowed to change those shared corners
+ * while every genuinely halo-only corner must remain byte-for-byte unchanged. */
+function D4_LandscapeSnapshot(start, end) {
+	local a = D4_FromTile(start), b = D4_FromTile(end), minx = a.x < b.x ? a.x : b.x, maxx = a.x > b.x ? a.x : b.x, miny = a.y < b.y ? a.y : b.y, maxy = a.y > b.y ? a.y : b.y;
+	local halo = [], corners = [], target = GSTile.GetCornerHeight(start, GSTile.CORNER_N), max_delta = 0, flat = true, area = (maxx-minx+1)*(maxy-miny+1);
+	for (local y = miny - 1; y <= maxy + 1; y++) for (local x = minx - 1; x <= maxx + 1; x++) {
+		local p = { x=x, y=y }; if (!D4_IsPointOnMap(p)) continue;
+		local tile = D4_ToTile(p), inner = x >= minx && x <= maxx && y >= miny && y <= maxy;
+		local hs = [GSTile.GetCornerHeight(tile, GSTile.CORNER_N), GSTile.GetCornerHeight(tile, GSTile.CORNER_E), GSTile.GetCornerHeight(tile, GSTile.CORNER_S), GSTile.GetCornerHeight(tile, GSTile.CORNER_W)];
+		/* OpenTTD 15.3 CmdTerraformLand aliases [N,E,S,W] to north-corner
+		 * vertices at [(0,0),(0,1),(1,1),(1,0)] respectively. */
+		local corner_x = [x, x, x + 1, x + 1], corner_y = [y, y + 1, y + 1, y], owned = [];
+		for (local i = 0; i < 4; i++) {
+			local is_owned = corner_x[i] >= minx && corner_x[i] <= maxx && corner_y[i] >= miny && corner_y[i] <= maxy;
+			owned.append(is_owned);
+			if (is_owned) { local d=abs(hs[i]-target); if(d>max_delta) max_delta=d; if(hs[i]!=target) flat=false; }
+		}
+		halo.append(tile); corners.append({ tile=tile, h=hs, inner=inner, owned=owned });
+	}
+	return { ok=true, halo=halo, corners=corners, target=target, max_delta=max_delta, flat=flat, area=area };
+}
+
+function D4_LandscapeReadback(before, after, target) {
+	return D4_LandscapeReadbackMismatch(before, after, target) == null;
+}
+
+/* Return only the first mismatch. This keeps failure evidence bounded while making
+ * real-engine corner-orientation/readback failures diagnosable instead of opaque. */
+function D4_LandscapeReadbackMismatch(before, after, target) {
+	if (!D4_IsArray(before) || !D4_IsArray(after) || before.len() != after.len()) return { reason = "record_count", before_count = D4_IsArray(before) ? before.len() : -1, after_count = D4_IsArray(after) ? after.len() : -1 };
+	for (local i = 0; i < before.len(); i++) {
+		if (before[i].tile != after[i].tile) return { reason = "tile_order", index = i, before_tile = before[i].tile, after_tile = after[i].tile };
+		if (!D4_Has(before[i], "owned") || !D4_Has(after[i], "owned") || before[i].owned.len() != 4 || after[i].owned.len() != 4) return { reason = "owned_mask", index = i, tile = before[i].tile };
+		for (local c = 0; c < 4; c++) {
+			if (before[i].owned[c] != after[i].owned[c]) return { reason = "ownership_changed", index = i, tile = before[i].tile, corner = c };
+			if (after[i].owned[c] && after[i].h[c] != target) return { reason = "owned_not_target", index = i, tile = before[i].tile, corner = c, before_height = before[i].h[c], after_height = after[i].h[c], target = target };
+			if (!after[i].owned[c] && before[i].h[c] != after[i].h[c]) return { reason = "halo_only_changed", index = i, tile = before[i].tile, corner = c, before_height = before[i].h[c], after_height = after[i].h[c], target = target };
+		}
+	}
+	return null;
+}
+
 function D4_ValidateBuildProgram(ops) {
 	if (!D4_IsArray(ops) || ops.len() < 1 || ops.len() > DIRECTORATE_M4_MAX_OPERATION_ENTRIES) return { ok = false, error = D4_Error("invalid_program_size", "") };
 	local station_count = 0;
@@ -962,7 +1334,10 @@ function D4_ValidateBuildProgram(ops) {
 	local map_area = GSMap.GetMapSizeX() * GSMap.GetMapSizeY();
 	foreach (op in ops) {
 		if (!D4_IsTable(op) || !("kind" in op) || typeof op.kind != "string" || !("op_id" in op) || typeof op.op_id != "string" || op.op_id.len() < 1 || op.op_id.len() > 128 || !("tile" in op) || typeof op.tile != "integer" || op.tile < 0 || op.tile >= map_area) return { ok = false, error = D4_Error("invalid_program_operation", "") };
-		if (op.kind == "station_rect") {
+		if (op.kind == "level_tiles") {
+			if (!("end_tile" in op) || !("target_height" in op) || !("affected_halo" in op) || !D4_IsArray(op.affected_halo) || op.affected_halo.len() < 1 || op.affected_halo.len() > 512 || !("before" in op) || !D4_IsArray(op.before)) return { ok = false, error = D4_Error("invalid_landscape_operation", op.op_id) };
+		}
+		else if (op.kind == "station_rect") {
 			if (!("end_tile" in op) || typeof op.end_tile != "integer" || op.end_tile < 0 || op.end_tile >= map_area || !("direction" in op) || typeof op.direction != "integer" || !("num_platforms" in op) || typeof op.num_platforms != "integer" || op.num_platforms < 1 || !("platform_length" in op) || typeof op.platform_length != "integer" || op.platform_length < 1 || !("destination_station" in op) || typeof op.destination_station != "integer") return { ok = false, error = D4_Error("invalid_station_operation", op.op_id) };
 			station_count++;
 		}
@@ -986,6 +1361,7 @@ function D4_PreflightBuildProgram(program, company_id, reserve, enforce_funds = 
 	local mode = GSCompanyMode(company_id);
 	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", company_id.tostring()) };
 	if (!D4_SelectRailType()) return { ok = false, error = D4_Error("rail_type_unavailable", company_id.tostring()) };
+	local footprint = D4_LandscapeFootprintSet(program.ops);
 	local tm = GSTestMode();
 	local tested_rails = {};
 	foreach (op in program.ops) {
@@ -995,6 +1371,17 @@ function D4_PreflightBuildProgram(program, company_id, reserve, enforce_funds = 
 		 * and commit performs authoritative signal readback after creating it. */
 		if (op.kind == "signal" && op.tile in tested_rails && !GSRail.IsRailTile(op.tile)) {
 			cost += GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_SIGNAL);
+			if (enforce_funds && !D4_CanAfford(company_id, reserve, cost)) return { ok = false, error = D4_Error("insufficient_funds", op.op_id), failed_op = op.op_id, cost = cost, reserve = reserve, mutation = false };
+			continue;
+		}
+		/* Same non-chaining limitation applies to any op that touches a pending
+		 * landscape op's footprint: the ground under it has not really been
+		 * levelled by this test-mode pass, so a real probe here would spuriously
+		 * fail on terrain that commit is about to fix first. Defer to commit's
+		 * authoritative real build + readback instead. */
+		if (op.kind != "level_tiles" && D4_OpTouchesFootprint(op, footprint)) {
+			cost += D4_ConservativeOperationCost(op);
+			if (op.kind == "rail_connection") tested_rails[op.tile] <- true;
 			if (enforce_funds && !D4_CanAfford(company_id, reserve, cost)) return { ok = false, error = D4_Error("insufficient_funds", op.op_id), failed_op = op.op_id, cost = cost, reserve = reserve, mutation = false };
 			continue;
 		}
@@ -1008,14 +1395,47 @@ function D4_PreflightBuildProgram(program, company_id, reserve, enforce_funds = 
 }
 
 function D4_ExecuteProgramOperation(op, company_id, test_only) {
+	if (op.kind == "level_tiles") {
+		local current = D4_LandscapeSnapshot(op.tile, op.end_tile);
+		if (!current.ok || current.area > DIRECTORATE_M4_MAX_LANDSCAPE_RECTANGLE_AREA || current.max_delta > DIRECTORATE_M4_MAX_LANDSCAPE_HEIGHT_DELTA) return { ok = false, failure = { reason = "landscape_policy_cap", op_id = op.op_id } };
+		local unsafe_tile = D4_LandscapeUnsafeOwnedTile(current, company_id);
+		if (unsafe_tile != null) return { ok = false, failure = { reason = "landscape_immutable_occupancy", op_id = op.op_id, tile = unsafe_tile } };
+		local estimate = D4_LandscapeEstimate(current.area, current.max_delta);
+		if (D4_Has(op, "estimated_cost") && op.estimated_cost > estimate) estimate = op.estimated_cost;
+		if (estimate > DIRECTORATE_M4_MAX_LANDSCAPE_COST) return { ok = false, failure = { reason = "landscape_cost_cap", op_id = op.op_id } };
+		local balance_before = GSCompany.GetBankBalance(company_id);
+		if (current.flat) return { ok = true, reused = true, cost = 0, detail = { kind = "landscape", before = current.corners, after = current.corners, fingerprint = D4_BoundedFingerprint(current.corners), end_tile = op.end_tile, target_height = current.target, estimated_cost = 0 } };
+		if (test_only) {
+			if (!GSTile.LevelTiles(op.tile, op.end_tile)) return { ok = false, failure = { reason = "level_tiles_failed", op_id = op.op_id, tile = op.tile } };
+			return { ok = true, reused = false, cost = estimate, detail = { kind = "landscape", before = current.corners, fingerprint = op.fingerprint, end_tile = op.end_tile, target_height = current.target, estimated_cost = estimate } };
+		}
+		local after = current, mismatch = { reason = "not_attempted" }, attempts = 0, command_failed = false;
+		local previous_fingerprint = D4_BoundedFingerprint(current.corners);
+		while (mismatch != null && attempts < DIRECTORATE_M4_MAX_LANDSCAPE_LEVEL_ATTEMPTS) {
+			if (!GSTile.LevelTiles(op.tile, op.end_tile)) { command_failed = true; break; }
+			attempts++;
+			after = D4_LandscapeSnapshot(op.tile, op.end_tile);
+			mismatch = after.ok ? D4_LandscapeReadbackMismatch(current.corners, after.corners, current.target) : { reason = "snapshot_failed" };
+			if (mismatch == null) break;
+			local fingerprint = D4_BoundedFingerprint(after.corners);
+			if (fingerprint == previous_fingerprint) { mismatch.no_progress <- true; break; }
+			previous_fingerprint = fingerprint;
+		}
+		local actual = balance_before - GSCompany.GetBankBalance(company_id); if (actual < 0) actual = 0;
+		if (mismatch != null || actual > estimate) return { ok = false, failure = { reason = "level_tiles_readback_failed", op_id = op.op_id, mismatch = mismatch, actual_cost = actual, estimated_cost = estimate, attempts = attempts, command_failed = command_failed } };
+		return { ok = true, reused = false, cost = actual, detail = { kind = "landscape", before = current.corners, after = after.corners, fingerprint = op.fingerprint, end_tile = op.end_tile, target_height = current.target, estimated_cost = estimate, actual_cost = actual, attempts = attempts } };
+	}
 	if (op.kind == "station_rect") {
 		if (GSRail.IsRailStationTile(op.tile) && GSTile.GetOwner(op.tile) == company_id) return { ok = true, reused = true, cost = 0, detail = D4_ReadbackProgramOperation(op, company_id, "station") };
-		if (!GSRail.BuildRailStation(op.tile, op.direction, op.num_platforms, op.platform_length, op.destination_station)) return { ok = false, failure = { reason = "station_build_failed", op_id = op.op_id, tile = op.tile } };
+		if (!GSRail.BuildRailStation(op.tile, op.direction, op.num_platforms, op.platform_length, op.destination_station)) return { ok = false, failure = { reason = "station_build_failed", op_id = op.op_id, tile = op.tile, end_tile = op.end_tile, slope = GSTile.GetSlope(op.tile), owner = GSTile.GetOwner(op.tile), last_error = GSError.GetLastErrorString(), balance = GSCompany.GetBankBalance(company_id) } };
 		return { ok = true, reused = false, cost = GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_STATION), detail = D4_ReadbackProgramOperation(op, company_id, "station") };
 	}
 	if (op.kind == "rail_connection") {
 		if (GSRail.AreTilesConnected(op.prev, op.tile, op.next) && GSTile.GetOwner(op.tile) == company_id) return { ok = true, reused = true, cost = 0, detail = D4_ReadbackProgramOperation(op, company_id, "rail") };
-		if (!GSRail.BuildRail(op.prev, op.tile, op.next)) return { ok = false, failure = { reason = "rail_build_failed", op_id = op.op_id, tile = op.tile, prev = op.prev, next = op.next } };
+		if (!GSRail.BuildRail(op.prev, op.tile, op.next)) {
+			local rail_tile = GSRail.IsRailTile(op.tile);
+			return { ok = false, failure = { reason = "rail_build_failed", op_id = op.op_id, tile = op.tile, prev = op.prev, next = op.next, slope = GSTile.GetSlope(op.tile), owner = GSTile.GetOwner(op.tile), rail_tile = rail_tile, rail_tracks = rail_tile ? GSRail.GetRailTracks(op.tile) : 0, last_error = GSError.GetLastErrorString() } };
+		}
 		if (!test_only && !GSRail.AreTilesConnected(op.prev, op.tile, op.next)) return { ok = false, failure = { reason = "rail_readback_failed", op_id = op.op_id, tile = op.tile } };
 		return { ok = true, reused = false, cost = GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_TRACK), detail = D4_ReadbackProgramOperation(op, company_id, "rail") };
 	}

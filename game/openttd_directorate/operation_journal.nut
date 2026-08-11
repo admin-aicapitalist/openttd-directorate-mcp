@@ -413,7 +413,9 @@ function D4_CommitOperation(plan, store, journal, company_id, reserve, op) {
 			local failed3 = { ok = false, error = D4_Error("journal_capacity", program_op.op_id), operation_id = op.operation_id, state = op.state, failed_op = program_op.op_id, rollback = rollback_result3, remaining = rollback_result3.remaining };
 			return failed3;
 		}
-		local item = { kind = built.detail.kind, tile = program_op.tile, op_id = program_op.op_id, detail = built.detail };
+		/* Keep full reversible evidence in the journal, but never echo hundreds of
+		 * corner snapshots through the bounded GameScript response channel. */
+		local item = { kind = built.detail.kind, tile = program_op.tile, op_id = program_op.op_id };
 		if (built.reused) reused.append(item); else created.append(item);
 	}
 	local verified = D4_VerifyProgramTopology(plan.build_program, company_id);
@@ -452,7 +454,7 @@ function D4_RollbackOperation(journal, op) {
 		local tile = entry.tile;
 		local detail = entry.detail;
 		local removed = D4_RemoveJournalledAsset(tile, detail, op.company_id);
-		if (!removed) remaining.append({ tile = tile, kind = D4_Has(detail, "kind") ? detail.kind : "unknown", detail = detail });
+		if (!removed) remaining.append({ tile = tile, kind = D4_Has(detail, "kind") ? detail.kind : "unknown" });
 	}
 	journal.MarkRolledBack(op, remaining);
 	return { ok = remaining.len() == 0, operation_id = op.operation_id, remaining = remaining };
@@ -510,7 +512,12 @@ function D4_IsSafeJournalEntry(entry, company_id, map_area = null) {
 function D4_IsSafeJournalDetail(detail, map_area = null) {
 	if (map_area == null) map_area = GSMap.GetMapSizeX() * GSMap.GetMapSizeY();
 	if (!("kind" in detail) || typeof detail.kind != "string") return false;
-	if (detail.kind != "station" && detail.kind != "depot" && detail.kind != "rail" && detail.kind != "signal") return false;
+	if (detail.kind != "station" && detail.kind != "depot" && detail.kind != "rail" && detail.kind != "signal" && detail.kind != "landscape") return false;
+	if (detail.kind == "landscape") {
+		if (!D4_Has(detail, "before") || !D4_IsArray(detail.before) || !D4_Has(detail, "after") || !D4_IsArray(detail.after) || detail.before.len() < 1 || detail.before.len() > 512 || detail.after.len() != detail.before.len()) return false;
+		foreach (record in detail.before) if (!D4_IsSafeLandscapeCornerRecord(record, map_area)) return false;
+		foreach (record2 in detail.after) if (!D4_IsSafeLandscapeCornerRecord(record2, map_area)) return false;
+	}
 	if (D4_Has(detail, "phase") && typeof detail.phase != "string") return false;
 	if (D4_Has(detail, "front") && (typeof detail.front != "integer" || detail.front < 0 || detail.front >= map_area)) return false;
 	if (D4_Has(detail, "station_end") && (typeof detail.station_end != "integer" || detail.station_end < 0 || detail.station_end >= map_area)) return false;
@@ -550,8 +557,38 @@ function D4_TileHasCompatibleAsset(tile, company_id, kind) {
 	return false;
 }
 
+function D4_IsSafeLandscapeCornerRecord(record, map_area) {
+	if (!D4_IsTable(record) || !D4_Has(record, "tile") || typeof record.tile != "integer" || record.tile < 0 || record.tile >= map_area || !D4_Has(record, "h") || !D4_IsArray(record.h) || record.h.len() != 4 || !D4_Has(record, "inner") || typeof record.inner != "bool" || !D4_Has(record, "owned") || !D4_IsArray(record.owned) || record.owned.len() != 4) return false;
+	foreach (height in record.h) if (typeof height != "integer" || height < 0 || height > 255) return false;
+	foreach (owned in record.owned) if (typeof owned != "bool") return false;
+	return true;
+}
+
+/* record.h is built by D4_LandscapeSnapshot in [N, E, S, W] order. GSTile.Corner is
+ * a distinct, differently-ordered enum from GSTile.Slope (RaiseTile/LowerTile's
+ * argument is a Slope bitmask, not a Corner ordinal), so the index must be mapped
+ * through both tables rather than reused as a raw integer for either call. */
+function D4_RestoreLandscape(detail) {
+	local corner_order = [GSTile.CORNER_N, GSTile.CORNER_E, GSTile.CORNER_S, GSTile.CORNER_W];
+	local slope_order = [GSTile.SLOPE_N, GSTile.SLOPE_E, GSTile.SLOPE_S, GSTile.SLOPE_W];
+	local steps = 0;
+	foreach (record in detail.before) for (local i = 0; i < 4; i++) {
+		local corner = corner_order[i], slope = slope_order[i], target = record.h[i];
+		while (GSTile.GetCornerHeight(record.tile, corner) != target && steps < DIRECTORATE_M4_MAX_LANDSCAPE_RESTORE_STEPS) {
+			local current = GSTile.GetCornerHeight(record.tile, corner);
+			if (current < target) { if (!GSTile.RaiseTile(record.tile, slope)) return false; } else { if (!GSTile.LowerTile(record.tile, slope)) return false; }
+			steps++;
+		}
+		if (GSTile.GetCornerHeight(record.tile, corner) != target) return false;
+	}
+	return true;
+}
+
 function D4_RemoveJournalledAsset(tile, detail, company_id) {
 	if (!GSMap.IsValidTile(tile) || !D4_IsTable(detail) || !D4_Has(detail, "kind")) return false;
+	/* Terrain becomes unowned after later assets are removed; restoration is guarded
+	 * by a sanitised exact before snapshot, not current ownership. */
+	if (detail.kind == "landscape") return D4_RestoreLandscape(detail);
 	if (GSTile.GetOwner(tile) != company_id) return false;
 	if (detail.kind == "station") {
 		if (!GSRail.IsRailStationTile(tile) || !D4_Has(detail, "station_end") || !GSMap.IsValidTile(detail.station_end)) return false;

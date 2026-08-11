@@ -52,6 +52,46 @@ const fixture = mkdtempSync(join(tmpdir(), "openttd-directorate-gate-"));
 const logPath = join(fixture, "openttd.log");
 const evidencePath = process.env.OPENTTD_GATE_EVIDENCE_PATH ?? join(tmpdir(), `openttd-directorate-gate-${createHash("sha1").update(fixture).digest("hex").slice(0, 12)}.json`);
 let serverRun = 0;
+/* A single stuck admin/game-script call must not be able to silently consume an
+ * entire external worker's time budget: bound every request well below typical
+ * worker deadlines so a hang produces a precise rejected-promise error (and
+ * therefore evidence) instead of running until something outside this process
+ * kills it with nothing recorded. */
+const requestTimeoutMs = Number.parseInt(process.env.OPENTTD_GATE_REQUEST_TIMEOUT_MS ?? "60000", 10);
+/* Each major phase (fresh server, restarted server) gets its own bounded
+ * deadline. On expiry the in-flight OpenTTD process is force-killed immediately
+ * so cleanup is reliable even if the phase never resolves on its own. */
+const phaseDeadlineMs = Number.parseInt(process.env.OPENTTD_GATE_PHASE_DEADLINE_MS ?? "240000", 10);
+let activeServer = null;
+
+/* A second, disposable fixture for the terrain-obstructed through_hub_4x7
+ * scenario: its own map, its own port pair, its own bridge copy, cleaned up
+ * independently of the flat-map gate above. */
+const hub4x7Fixture = mkdtempSync(join(tmpdir(), "openttd-directorate-gate-hub4x7-"));
+const hub4x7LogPath = join(hub4x7Fixture, "openttd.log");
+const hub4x7Port = Number.parseInt(process.env.OPENTTD_DIRECTORATE_GATE_HUB4X7_PORT ?? String(port + 10), 10);
+const hub4x7GamePort = Number.parseInt(process.env.OPENTTD_DIRECTORATE_GATE_HUB4X7_GAME_PORT ?? String(hub4x7Port + 1), 10);
+
+async function withPhaseDeadline(name, fn) {
+  let timeoutHandle;
+  const timeout = new Promise((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      if (activeServer && !activeServer.killed) {
+        try {
+          activeServer.kill("SIGKILL");
+        } catch {
+          // Best-effort: the process may already be exiting.
+        }
+      }
+      reject(new Error(`phase "${name}" exceeded bounded deadline of ${phaseDeadlineMs}ms`));
+    }, phaseDeadlineMs);
+  });
+  try {
+    return await Promise.race([fn(), timeout]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
 
 function writeConfig() {
   mkdirSync(join(fixture, "game"), { recursive: true });
@@ -292,6 +332,249 @@ autosave_interval = 0
   );
 }
 
+function writeHub4x7Config() {
+  mkdirSync(join(hub4x7Fixture, "game"), { recursive: true });
+  mkdirSync(join(hub4x7Fixture, "ai/directorate_gate_fixture"), { recursive: true });
+  mkdirSync(join(hub4x7Fixture, "baseset"), { recursive: true });
+
+  cpSync(join(repoRoot, "game/openttd_directorate"), join(hub4x7Fixture, "game/openttd_directorate"), { recursive: true });
+  const fixtureBridgePath = join(hub4x7Fixture, "game/openttd_directorate/bridge.nut");
+  const fixtureBridge = readFileSync(fixtureBridgePath, "utf8");
+  /* Every probe here is disposable scaffolding for this one fixture: it proves
+   * that a genuinely terrain-obstructed through_hub_4x7 pad requires and
+   * executes GSTile.LevelTiles, that the journal's landscape readback is
+   * self-consistent against a fresh live re-snapshot, and that rolling back a
+   * landscape entry whose tiles are now covered by real track/station honestly
+   * reports rollback_partial (the bounded RaiseTile/LowerTile attempt budget
+   * cannot succeed once track sits on top of the levelled ground). */
+  const hub4x7Probe = `\t\tif (payload.command == "hub4x7_place_industries_probe") {
+\t\t\tif (!D4_Has(payload, "params") || !D4_Has(payload.params, "source_center") || !D4_IsTable(payload.params.source_center) || !D4_Has(payload.params, "destination_center") || !D4_IsTable(payload.params.destination_center)) return { ok = false, error = D4_Error("invalid_place_industries", "") };
+\t\t\t/* Deity mode (the GameScript's ambient context whenever no GSCompanyMode is
+\t\t\t * active) bypasses the "raw industry construction" difficulty setting, so
+\t\t\t * this places a COAL_MINE (industry type 0) and a POWER_STATION (type 1,
+\t\t\t * COAL-accepting) at exact, chosen tiles instead of depending on whatever
+\t\t\t * the map generator happened to place -- this fixture owns its own source
+\t\t\t * and destination with proven map-edge clearance, rather than hoping a
+\t\t\t * procedurally-generated industry happens to sit somewhere the much larger
+\t\t\t * through_hub_4x7 fan/merge geometry can actually reach. */
+\t\t\tlocal offsets = [{ x = 0, y = 0 }];
+\t\t\tfor (local ring = 5; ring <= 15; ring += 5) {
+\t\t\t\tfor (local dx = -ring; dx <= ring; dx += 5) {
+\t\t\t\t\tfor (local dy = -ring; dy <= ring; dy += 5) {
+\t\t\t\t\t\tlocal adx = dx < 0 ? -dx : dx;
+\t\t\t\t\t\tlocal ady = dy < 0 ? -dy : dy;
+\t\t\t\t\t\tlocal magnitude = adx > ady ? adx : ady;
+\t\t\t\t\t\tif (magnitude == ring) offsets.append({ x = dx, y = dy });
+\t\t\t\t\t}
+\t\t\t\t}
+\t\t\t}
+\t\t\tlocal known_industries = {};
+\t\t\tlocal initial_industries = GSIndustryList();
+\t\t\tfor (local industry_id = initial_industries.Begin(); !initial_industries.IsEnd(); industry_id = initial_industries.Next()) known_industries[industry_id] <- true;
+\t\t\tlocal source_tile = null;
+\t\t\tlocal source_attempts = 0;
+\t\t\tforeach (offset in offsets) {
+\t\t\t\tsource_attempts++;
+\t\t\t\tlocal p = { x = payload.params.source_center.x + offset.x, y = payload.params.source_center.y + offset.y };
+\t\t\t\tif (!D4_IsPointOnMap(p)) continue;
+\t\t\t\tlocal tile = D4_ToTile(p);
+\t\t\t\tif (GSIndustryType.BuildIndustry(0, tile)) { source_tile = tile; break; }
+\t\t\t}
+\t\t\tif (source_tile == null) return { ok = false, error = D4_Error("source_industry_build_failed", source_attempts.tostring()) };
+\t\t\tlocal source_id = null;
+\t\t\tlocal after_source = GSIndustryList();
+\t\t\tfor (local industry_id = after_source.Begin(); !after_source.IsEnd(); industry_id = after_source.Next()) {
+\t\t\t\tif (!known_industries.rawin(industry_id) && GSIndustry.IsValidIndustry(industry_id)) { source_id = industry_id; break; }
+\t\t\t}
+\t\t\tif (source_id == null) return { ok = false, error = D4_Error("source_industry_id_resolve_failed", "") };
+\t\t\tknown_industries[source_id] <- true;
+\t\t\tlocal destination_tile = null;
+\t\t\tlocal destination_attempts = 0;
+\t\t\tforeach (offset in offsets) {
+\t\t\t\tdestination_attempts++;
+\t\t\t\tlocal p = { x = payload.params.destination_center.x + offset.x, y = payload.params.destination_center.y + offset.y };
+\t\t\t\tif (!D4_IsPointOnMap(p)) continue;
+\t\t\t\tlocal tile = D4_ToTile(p);
+\t\t\t\tif (GSIndustryType.BuildIndustry(1, tile)) { destination_tile = tile; break; }
+\t\t\t}
+\t\t\tif (destination_tile == null) return { ok = false, error = D4_Error("destination_industry_build_failed", destination_attempts.tostring()) };
+\t\t\tlocal destination_id = null;
+\t\t\tlocal after_destination = GSIndustryList();
+\t\t\tfor (local industry_id = after_destination.Begin(); !after_destination.IsEnd(); industry_id = after_destination.Next()) {
+\t\t\t\tif (!known_industries.rawin(industry_id) && GSIndustry.IsValidIndustry(industry_id)) { destination_id = industry_id; break; }
+\t\t\t}
+\t\t\tif (destination_id == null) return { ok = false, error = D4_Error("destination_industry_id_resolve_failed", "") };
+\t\t\treturn { ok = true, payload = { source_industry_id = source_id, destination_industry_id = destination_id, source_tile_point = D4_FromTile(GSIndustry.GetLocation(source_id)), destination_tile_point = D4_FromTile(GSIndustry.GetLocation(destination_id)), source_attempts = source_attempts, destination_attempts = destination_attempts } };
+\t\t}
+\t\tif (payload.command == "hub4x7_terrain_bump_probe") {
+\t\t\tlocal mode = GSCompanyMode(payload.company_id);
+\t\t\tif (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("probe_company_mode_failed", payload.company_id.tostring()) };
+\t\t\tif (!GSIndustry.IsValidIndustry(payload.params.industry_id)) return { ok = false, error = D4_Error("probe_invalid_industry", payload.params.industry_id.tostring()) };
+\t\t\tlocal origin = D4_FromTile(GSIndustry.GetLocation(payload.params.industry_id));
+\t\t\tlocal radius = payload.params.radius;
+\t\t\tlocal spacing = payload.params.spacing;
+\t\t\tlocal delta = payload.params.delta;
+\t\t\tlocal bumped = 0;
+\t\t\tfor (local dx = -radius; dx <= radius; dx += spacing) {
+\t\t\t\tfor (local dy = -radius; dy <= radius; dy += spacing) {
+\t\t\t\t\tlocal p = { x = origin.x + dx, y = origin.y + dy };
+\t\t\t\t\tif (!D4_IsPointOnMap(p)) continue;
+\t\t\t\t\tlocal tile = D4_ToTile(p);
+\t\t\t\t\tif (D4_IsTileWater(tile) || !GSTile.IsBuildable(tile)) continue;
+\t\t\t\t\tlocal slopes = [GSTile.SLOPE_N, GSTile.SLOPE_E, GSTile.SLOPE_S, GSTile.SLOPE_W];
+\t\t\t\t\tforeach (slope in slopes) for (local step = 0; step < delta; step++) if (GSTile.RaiseTile(tile, slope)) bumped++;
+\t\t\t\t}
+\t\t\t}
+\t\t\treturn { ok = true, payload = { bumped = bumped } };
+\t\t}
+\t\tif (payload.command == "hub4x7_fund_company_probe") {
+\t\t\tlocal mode = GSCompanyMode(payload.company_id);
+\t\t\tif (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("probe_company_mode_failed", payload.company_id.tostring()) };
+\t\t\tlocal maximum = GSCompany.GetMaxLoanAmount();
+\t\t\tif (!GSCompany.SetLoanAmount(maximum)) return { ok = false, error = D4_Error("probe_max_loan_failed", maximum.tostring()) };
+\t\t\treturn { ok = true, payload = { bank_balance = GSCompany.GetBankBalance(payload.company_id), loan_amount = GSCompany.GetLoanAmount(), max_loan_amount = maximum } };
+\t\t}
+\t\tif (payload.command == "hub4x7_landscape_plan_probe") {
+\t\t\tlocal plan = this.store.GetPlan(payload.params.plan_id);
+\t\t\tif (plan == null || !D4_Has(plan, "build_program") || !plan.build_program.ok) return { ok = false, error = D4_Error("probe_plan_missing", payload.params.plan_id) };
+\t\t\tlocal landscape_ops = [];
+\t\t\tlocal source_station = null, destination_station = null, signal_count = 0;
+\t\t\tforeach (op in plan.build_program.ops) {
+\t\t\t\tif (op.kind == "level_tiles") landscape_ops.append({ op_id = op.op_id, tile = op.tile, end_tile = op.end_tile, target_height = op.target_height, maximum_tiles = op.maximum_tiles, maximum_height_delta = op.maximum_height_delta });
+\t\t\t\telse if (op.op_id == "source_station") source_station = op;
+\t\t\t\telse if (op.op_id == "destination_station") destination_station = op;
+\t\t\t\telse if (op.kind == "signal") signal_count++;
+\t\t\t}
+\t\t\tlocal topology = plan.build_program.topology;
+\t\t\treturn { ok = landscape_ops.len() > 0 && source_station != null && destination_station != null, payload = { landscape_ops = landscape_ops, total_ops = plan.build_program.ops.len(), source_rect = { platforms = source_station.num_platforms, length = source_station.platform_length }, destination_rect = { platforms = destination_station.num_platforms, length = destination_station.platform_length }, source_entries = topology.source.entries.len(), destination_entries = topology.destination.entries.len(), signal_count = signal_count } };
+\t\t}
+\t\tif (payload.command == "hub4x7_landscape_readback_probe") {
+\t\t\tlocal op = this.store.journal.Get(payload.params.operation_id);
+\t\t\tif (op == null) return { ok = false, error = D4_Error("probe_operation_missing", payload.params.operation_id) };
+\t\t\tlocal landscape_entries = [];
+\t\t\tlocal all_ok = true;
+\t\t\tforeach (entry in op.entries) {
+\t\t\t\tif (!D4_IsTable(entry.detail) || !D4_Has(entry.detail, "kind") || entry.detail.kind != "landscape") continue;
+\t\t\t\tlocal detail = entry.detail;
+\t\t\t\tlocal self_consistent = D4_LandscapeReadback(detail.before, detail.after, detail.target_height);
+\t\t\t\tlocal live = D4_LandscapeSnapshot(entry.tile, detail.end_tile);
+\t\t\t\tlocal live_consistent = live.ok && D4_LandscapeReadback(detail.before, live.corners, detail.target_height);
+\t\t\t\tlocal cost_ok = detail.actual_cost >= 0 && detail.actual_cost <= detail.estimated_cost;
+\t\t\t\t/* Later bounded landscape entries may overlap and legitimately supersede
+\t\t\t\t * an earlier entry's live snapshot. Per-entry commit readback and cost
+\t\t\t\t * remain mandatory; final topology is checked independently below. */
+\t\t\t\tif (!self_consistent || !cost_ok) all_ok = false;
+\t\t\t\tlandscape_entries.append({ tile = entry.tile, end_tile = detail.end_tile, target_height = detail.target_height, estimated_cost = detail.estimated_cost, actual_cost = detail.actual_cost, self_consistent = self_consistent, live_consistent = live_consistent, cost_ok = cost_ok, before_count = detail.before.len(), after_count = detail.after.len() });
+\t\t\t}
+\t\t\tif (landscape_entries.len() == 0) all_ok = false;
+\t\t\treturn { ok = all_ok, payload = { landscape_entries = landscape_entries, operation_state = op.state } };
+\t\t}
+\t\tif (payload.command == "hub4x7_landscape_partial_rollback_seed_probe") {
+\t\t\tlocal source_op = this.store.journal.Get(payload.params.operation_id);
+\t\t\tif (source_op == null) return { ok = false, error = D4_Error("probe_source_missing", "") };
+\t\t\tlocal landscape_entry = null;
+\t\t\tforeach (entry in source_op.entries) {
+\t\t\t\tif (D4_IsTable(entry.detail) && D4_Has(entry.detail, "kind") && entry.detail.kind == "landscape") { landscape_entry = entry; break; }
+\t\t\t}
+\t\t\tif (landscape_entry == null) return { ok = false, error = D4_Error("probe_no_landscape_entry", "") };
+\t\t\tlocal synthetic_id = payload.params.synthetic_operation_id;
+\t\t\tlocal synthetic = { operation_id = synthetic_id, company_id = payload.company_id, plan_id = payload.params.plan_id, revision = payload.params.revision, phase = "commit", request_fingerprint = "hub4x7-landscape-partial-rollback-probe", state = "completed", entries = [{ kind = "created", tile = landscape_entry.tile, detail = landscape_entry.detail }], created_tick = D4_Tick(), completed_tick = D4_Tick(), result = { ok = true, operation_id = synthetic_id, state = "completed" }, rollback = null };
+\t\t\tthis.store.journal.operations[synthetic_id] <- synthetic;
+\t\t\tthis.store.journal.order.append(synthetic_id);
+\t\t\treturn { ok = true, payload = { seeded = synthetic_id, tile = landscape_entry.tile } };
+\t\t}
+`;
+  const hubRuntimeProbe = `\t\tif (payload.command == "through_hub_runtime_probe") {
+\t\t\tlocal mode = GSCompanyMode(payload.company_id);
+\t\t\tif (!GSCompanyMode.IsValid() || !D4_Has(payload, "params") || !D4_Has(payload.params, "route_ids") || !D4_IsArray(payload.params.route_ids)) return { ok = false, error = D4_Error("runtime_probe_invalid", "") };
+\t\t\tlocal rows = [];
+\t\t\tfor (local ri = 0; ri < payload.params.route_ids.len() && ri < 8; ri++) {
+\t\t\t\tlocal route_id = payload.params.route_ids[ri];
+\t\t\t\tlocal route = this.store.registry.Get(route_id);
+\t\t\t\tif (route == null || route.topology == null) { rows.append({ route_id = route_id, ok = false }); continue; }
+\t\t\t\tlocal source_platform_rows = {}, destination_platform_rows = {}, source_egress_rows = {}, destination_egress_rows = {};
+\t\t\t\tfor (local i = 0; i < route.topology.source.entries.len(); i++) source_platform_rows[D4_ToTile(route.topology.source.entries[i].platform)] <- i;
+\t\t\t\tfor (local j = 0; j < route.topology.destination.entries.len(); j++) destination_platform_rows[D4_ToTile(route.topology.destination.entries[j].platform)] <- j;
+\t\t\t\tfor (local k = 0; k < route.topology.source.exits.len(); k++) source_egress_rows[D4_ToTile(route.topology.source.exits[k].exit)] <- k;
+\t\t\t\tfor (local m = 0; m < route.topology.destination.exits.len(); m++) destination_egress_rows[D4_ToTile(route.topology.destination.exits[m].exit)] <- m;
+\t\t\t\tlocal vehicles = [];
+\t\t\t\tforeach (entry in route.vehicles) {
+\t\t\t\t\tif (!GSVehicle.IsValidVehicle(entry.vehicle_id)) { vehicles.append({ vehicle_id = entry.vehicle_id, valid = false }); continue; }
+\t\t\t\t\tlocal location = GSVehicle.GetLocation(entry.vehicle_id);
+\t\t\t\t\tvehicles.append({ vehicle_id = entry.vehicle_id, valid = true, location = location, current_order = GSOrder.ResolveOrderPosition(entry.vehicle_id, GSOrder.ORDER_CURRENT), load = GSVehicle.GetCargoLoad(entry.vehicle_id, route.cargo_type), profit_last_year = GSVehicle.GetProfitLastYear(entry.vehicle_id), profit_this_year = GSVehicle.GetProfitThisYear(entry.vehicle_id), source_row = location in source_platform_rows ? source_platform_rows[location] : -1, destination_row = location in destination_platform_rows ? destination_platform_rows[location] : -1, source_egress_row = location in source_egress_rows ? source_egress_rows[location] : -1, destination_egress_row = location in destination_egress_rows ? destination_egress_rows[location] : -1 });
+\t\t\t\t}
+\t\t\t\trows.append({ route_id = route_id, ok = true, vehicles = vehicles });
+\t\t\t}
+\t\t\treturn { ok = true, payload = { tick = D4_Tick(), routes = rows } };
+\t\t}
+`;
+  const fixtureBridgeWithProbe = fixtureBridge.replace('\t\tif (payload.command == "survey_sites") {', hub4x7Probe + hubRuntimeProbe + '\t\tif (payload.command == "survey_sites") {');
+  if (fixtureBridgeWithProbe === fixtureBridge) throw new Error("failed to inject hub4x7 landscape probes");
+  writeFileSync(fixtureBridgePath, fixtureBridgeWithProbe);
+  cpSync(openGfx, join(hub4x7Fixture, "baseset"), { recursive: true });
+  writeFileSync(
+    join(hub4x7Fixture, "ai/directorate_gate_fixture/info.nut"),
+    `class DirectorateGateFixtureInfo extends AIInfo {
+  function GetAuthor()      { return "OpenTTD Directorate"; }
+  function GetName()        { return "Directorate Gate Fixture"; }
+  function GetDescription() { return "Disposable no-op company for the directorate real-engine gate"; }
+  function GetVersion()     { return 1; }
+  function GetDate()        { return "2026-07-29"; }
+  function CreateInstance() { return "DirectorateGateFixture"; }
+  function GetShortName()   { return "D4GF"; }
+  function GetAPIVersion()  { return "15"; }
+}
+RegisterAI(DirectorateGateFixtureInfo());
+`,
+  );
+  writeFileSync(
+    join(hub4x7Fixture, "ai/directorate_gate_fixture/main.nut"),
+    `class DirectorateGateFixture extends AIController {
+  function Start() {
+    while (true) this.Sleep(100);
+  }
+}
+`,
+  );
+  writeFileSync(
+    join(hub4x7Fixture, "openttd.cfg"),
+    `[misc]
+autosave = off
+
+[music]
+name = NoMusic
+
+[game_scripts]
+"OpenTTD Directorate" = 4
+
+[network]
+server_admin_port = ${hub4x7Port}
+admin_password = ${password}
+allow_insecure_admin_login = true
+server_game_type = local
+server_name = "OpenTTD Directorate Real Engine Gate (hub4x7 terrain-obstructed)"
+max_companies = 4
+
+[game_creation]
+map_x = 7
+map_y = 7
+starting_year = 1950
+
+[difficulty]
+industry_density = 0
+number_towns = 0
+terrain_type = 0
+quantity_sea_lakes = 0
+
+[pf]
+forbid_90_deg = true
+
+[gui]
+autosave_interval = 0
+`,
+  );
+}
+
 function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
@@ -380,15 +663,18 @@ function gitOutput(args, fallback = "") {
   return "";
 }
 
-async function withServer(loadGame, fn) {
+async function withServer(loadGame, fn, options = {}) {
+  const serverFixture = options.fixture ?? fixture;
+  const serverGamePort = options.gamePort ?? gamePort;
+  const serverLogPath = options.logPath ?? logPath;
   serverRun += 1;
-  const runLogPath = `${logPath}.${serverRun}`;
+  const runLogPath = `${serverLogPath}.${serverRun}`;
   const out = [];
   const args = [
     "-D",
-    `127.0.0.1:${gamePort}`,
+    `127.0.0.1:${serverGamePort}`,
     "-c",
-    join(fixture, "openttd.cfg"),
+    join(serverFixture, "openttd.cfg"),
     "-x",
     "-X",
     "-g",
@@ -404,7 +690,8 @@ async function withServer(loadGame, fn) {
     "-d",
     "script=4,net=2,misc=0",
   ];
-  const server = spawn(openttd, args, { cwd: fixture, stdio: ["ignore", "pipe", "pipe"] });
+  const server = spawn(openttd, args, { cwd: serverFixture, stdio: ["ignore", "pipe", "pipe"] });
+  activeServer = server;
   server.stdout.on("data", (chunk) => out.push(chunk));
   server.stderr.on("data", (chunk) => out.push(chunk));
   let exit = null;
@@ -419,8 +706,9 @@ async function withServer(loadGame, fn) {
     server.kill("SIGTERM");
     await delay(500);
     if (!server.killed) server.kill("SIGKILL");
+    if (activeServer === server) activeServer = null;
     writeFileSync(runLogPath, Buffer.concat(out).toString("utf8"));
-    writeFileSync(logPath, Buffer.concat(out).toString("utf8"));
+    writeFileSync(serverLogPath, Buffer.concat(out).toString("utf8"));
   }
 }
 
@@ -439,6 +727,287 @@ async function request(handlers, op, payload) {
   return response;
 }
 
+/**
+ * DISPOSABLE fixture: a through_hub_4x7 RoRo whose station pads are forced onto
+ * deliberately obstructed (non-flat) terrain, proving landscaping is required and
+ * executed for real, not merely wired but unreachable. Runs against its own
+ * server/fixture directory and its own bounded phase deadlines, and its findings
+ * are appended to the same evidence object as the flat-map gate above.
+ */
+async function runTerrainObstructedHub4x7Fixture(evidence) {
+  writeHub4x7Config();
+  let commitRevision = 0;
+
+  await withServer(null, async () => {
+    const client = new AdminClient({
+      host: "127.0.0.1",
+      port: hub4x7Port,
+      password,
+      name: "directorate real-engine gate hub4x7",
+      version: "0.1.0",
+      requestTimeoutMs,
+      connectTimeoutMs: 10000,
+      pingIntervalMs: 0,
+      reconnect: { enabled: false, maxAttempts: 0, initialDelayMs: 100, maxDelayMs: 100 },
+      maxResponseBytes: 1024 * 1024,
+      maxResponseChunks: 256,
+      maxPendingRequests: 16,
+    });
+    await client.connect();
+    const handlers = createToolHandlers(new AdminOpenTtdGateway(client));
+    evidence.steps.push({ name: "hub4x7_connect", ok: true });
+    await client.rcon('start_ai "Directorate Gate Fixture"');
+    await delay(1000);
+
+    /* The map's only procedurally-generated COAL source sits 4 tiles from the
+     * map's north edge (verified: this deterministic seed places exactly one
+     * COAL-producing industry), too close for through_hub_4x7's much larger
+     * fan/merge geometry to find any candidate within the site-search budget --
+     * that was the root cause of a prior source_site_not_found blocker here.
+     * Rather than depend on wherever map generation happened to place
+     * industries, this fixture builds its own COAL_MINE/POWER_STATION pair at
+     * chosen central tiles with generous, proven map-edge clearance. Each
+     * center has a small deterministic fallback offset list in case the exact
+     * tile isn't buildable (slope/occupancy); the whole placement stays
+     * bounded and reproducible for this fixed map seed. */
+
+    // 128x128 map: (40,40) and (90,90) each keep >=37 tiles of clearance from
+    // every map edge, far beyond through_hub_4x7's ~17-tile worst-case reach
+    // (site_search_radius 4 + blueprint fan/merge/loop span), and sit on the
+    // dominant SE/NW diagonal so pairing doesn't also have to fight geometry
+    // this fixture isn't testing.
+    const placeWire = await client.requestGameScript("execute", {
+      company_id: 0,
+      command: "hub4x7_place_industries_probe",
+      params: {
+        source_center: { x: 40, y: 40 },
+        destination_center: { x: 90, y: 90 },
+      },
+    });
+    const placed = assertOk("hub4x7_place_industries", placeWire.payload);
+    const sourceIndustryId = placed.payload?.source_industry_id;
+    const destinationIndustryId = placed.payload?.destination_industry_id;
+    if (typeof sourceIndustryId !== "number" || typeof destinationIndustryId !== "number") {
+      throw new Error(`hub4x7 industry placement did not resolve ids: ${JSON.stringify(placed)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_place_industries", response: placeWire });
+
+    const fundWire = await client.requestGameScript("execute", { company_id: 0, command: "hub4x7_fund_company_probe", params: {} });
+    const funded = assertOk("hub4x7_fund_company_probe", fundWire.payload);
+    if (typeof funded.payload?.bank_balance !== "number" || funded.payload.bank_balance < 250000) {
+      throw new Error(`hub4x7 fixture did not fund terminal construction: ${JSON.stringify(funded)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_fund_company_probe", response: fundWire });
+
+    /* The fixed seed's natural terrain intersects the deterministic fan/loop
+     * geometry. The required non-empty level_tiles manifest below is the proof;
+     * do not manufacture broad cliffs that correctly trigger halo rejection. */
+    const companyAfterFixtureSetup = assertOk("hub4x7_company_after_fixture_setup", await request(handlers, "execute", {
+      company_id: 0,
+      command: "get_company_info",
+      params: {},
+    }));
+    if (typeof companyAfterFixtureSetup.payload?.bank_balance !== "number" || companyAfterFixtureSetup.payload.bank_balance < 50000) {
+      throw new Error(`hub4x7 fixture setup contaminated company finances: ${JSON.stringify(companyAfterFixtureSetup)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_company_after_fixture_setup", response: companyAfterFixtureSetup });
+
+    const plan = await request(handlers, "plan", {
+      company_id: 0,
+      plan_id: "directorate-hub4x7-gate-plan",
+      intent: { source_industry_id: sourceIndustryId, destination_industry_id: destinationIndustryId },
+      policy: {
+        station_template: "through_hub_4x7",
+        /* Four rings cover the central fixture's deterministic candidate set
+         * while keeping exact-engine survey and pairing bounded. */
+        site_search_radius: 4,
+        site_pair_skip: Number.parseInt(process.env.OPENTTD_GATE_HUB4X7_PAIR_SKIP ?? "1", 10),
+        route_expansion_limit: 32768,
+        route_frontier_limit: 32768,
+        route_turn_cost: 50,
+        wagon_count: 1,
+        signals: true,
+      },
+    });
+    evidence.steps.push({ name: "hub4x7_plan", response: assertOk("hub4x7_plan", plan) });
+    if (!plan.ok || plan.payload?.revision === undefined) throw new Error("hub4x7 plan did not return revision");
+    const revision = plan.payload.revision;
+
+    const landscapePlanProbeWire = await client.requestGameScript("execute", { company_id: 0, command: "hub4x7_landscape_plan_probe", params: { plan_id: "directorate-hub4x7-gate-plan" } });
+    const landscapePlanProbe = assertOk("hub4x7_landscape_plan_probe", landscapePlanProbeWire.payload);
+    if (!Array.isArray(landscapePlanProbe.payload?.landscape_ops) || landscapePlanProbe.payload.landscape_ops.length < 1) {
+      throw new Error(`hub4x7 plan did not require landscaping on obstructed terrain: ${JSON.stringify(landscapePlanProbe)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_landscape_plan_probe", response: landscapePlanProbeWire });
+
+    evidence.steps.push({
+      name: "hub4x7_preflight",
+      response: assertOk("hub4x7_preflight", await request(handlers, "apply", {
+        company_id: 0,
+        plan_id: "directorate-hub4x7-gate-plan",
+        revision,
+        phase: "preflight",
+        operation_id: "directorate-hub4x7-gate.preflight",
+      })),
+    });
+
+    const commit = assertOk("hub4x7_commit", await request(handlers, "apply", {
+      company_id: 0,
+      plan_id: "directorate-hub4x7-gate-plan",
+      revision,
+      phase: "commit",
+      operation_id: "directorate-hub4x7-gate.commit",
+    }));
+    evidence.steps.push({ name: "hub4x7_commit", response: commit });
+    commitRevision = commit.payload?.revision ?? revision + 1;
+
+    const readbackWire = await client.requestGameScript("execute", { company_id: 0, command: "hub4x7_landscape_readback_probe", params: { operation_id: "directorate-hub4x7-gate.commit" } });
+    const readback = assertOk("hub4x7_landscape_readback_probe", readbackWire.payload);
+    if (!Array.isArray(readback.payload?.landscape_entries) || readback.payload.landscape_entries.length < 1) {
+      throw new Error(`hub4x7 commit did not execute a landscape op: ${JSON.stringify(readback)}`);
+    }
+    for (const entry of readback.payload.landscape_entries) {
+      if (!entry.self_consistent || !entry.cost_ok) {
+        throw new Error(`hub4x7 landscape readback failed bounded verification: ${JSON.stringify(entry)}`);
+      }
+    }
+    if (!readback.payload.landscape_entries.some((entry) => entry.live_consistent)) {
+      throw new Error(`hub4x7 final landscape state matches no committed entry: ${JSON.stringify(readback)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_landscape_readback_probe", response: readbackWire });
+
+    if (landscapePlanProbe.payload?.source_rect?.platforms !== 4 || landscapePlanProbe.payload?.source_rect?.length !== 7 || landscapePlanProbe.payload?.destination_rect?.platforms !== 4 || landscapePlanProbe.payload?.destination_rect?.length !== 7) {
+      throw new Error(`hub4x7 station rectangles are not 4x7: ${JSON.stringify(landscapePlanProbe)}`);
+    }
+    if (landscapePlanProbe.payload?.source_entries !== 4 || landscapePlanProbe.payload?.destination_entries !== 4 || !(landscapePlanProbe.payload?.signal_count >= 8)) {
+      throw new Error(`hub4x7 fan/merge/signal manifest incomplete: ${JSON.stringify(landscapePlanProbe)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_through_hub_manifest", response: landscapePlanProbe });
+
+    const commission = assertRouteCommissioned("hub4x7_commission_route", await request(handlers, "commission", {
+      company_id: 0,
+      plan_id: "directorate-hub4x7-gate-plan",
+      route_id: "directorate-hub4x7-gate-route",
+      cargo_label: "",
+    }));
+    evidence.steps.push({ name: "hub4x7_commission_route", response: commission });
+
+    const secondCommission = assertRouteCommissioned("hub4x7_commission_route_second", await request(handlers, "commission", {
+      company_id: 0,
+      plan_id: "directorate-hub4x7-gate-plan",
+      route_id: "directorate-hub4x7-gate-route-second",
+      cargo_label: "",
+    }));
+    evidence.steps.push({ name: "hub4x7_commission_route_second", response: secondCommission });
+
+    let profitable = false;
+    const runtimeHistory = new Map();
+    for (let attempt = 0; attempt < 48; attempt++) {
+      let runtimeProbeWire = null;
+      for (let sample = 0; sample < 10; sample++) {
+        await delay(500);
+        runtimeProbeWire = await client.requestGameScript("execute", {
+          company_id: 0,
+          command: "through_hub_runtime_probe",
+          params: { route_ids: ["directorate-hub4x7-gate-route", "directorate-hub4x7-gate-route-second"] },
+        });
+        const runtimeProbe = assertOk("hub4x7_through_hub_runtime_probe", runtimeProbeWire.payload);
+        updateRuntimeHistory(runtimeHistory, runtimeProbe);
+      }
+      const poll = await request(handlers, "verify", { company_id: 0, route_id: "directorate-hub4x7-gate-route", level: "economic" });
+      const secondPoll = await request(handlers, "verify", { company_id: 0, route_id: "directorate-hub4x7-gate-route-second", level: "economic" });
+      if (attempt % 4 === 0 || attempt === 47 || poll.ok === true || secondPoll.ok === true) {
+        evidence.steps.push({ name: "hub4x7_verify_economic_runtime_poll", attempt, first: poll, second: secondPoll, runtime: runtimeProbeWire });
+      }
+      if (poll.ok === true && poll.payload?.health?.positive_revenue === true && secondPoll.ok === true && secondPoll.payload?.health?.positive_revenue === true) {
+        evidence.steps.push({ name: "hub4x7_verify_economic_both_profitable", attempt, first: poll, second: secondPoll });
+        profitable = true;
+        break;
+      }
+    }
+    if (!profitable) throw new Error("hub4x7 both routes did not become profitable within poll window");
+    const runtimeSummary = runtimeHistorySummary(runtimeHistory);
+    evidence.steps.push({ name: "hub4x7_through_hub_runtime_history", response: runtimeSummary });
+    const totalDeliveries = Object.values(runtimeSummary).reduce((sum, route) => sum + route.deliveries, 0);
+    const usedRows = new Set(Object.values(runtimeSummary).flatMap((route) => [...route.source_rows, ...route.destination_rows]));
+    const usedEgress = new Set(Object.values(runtimeSummary).flatMap((route) => route.rear_egress_rows));
+    if (totalDeliveries < 2 || usedRows.size < 2) throw new Error(`hub4x7 runtime did not prove two deliveries across both platform rows: ${JSON.stringify(runtimeSummary)}`);
+    if (usedEgress.size < 1) throw new Error(`hub4x7 runtime did not prove a rear egress row: ${JSON.stringify(runtimeSummary)}`);
+
+    /* Prove the bounded rollback path against real, still-in-use infrastructure:
+     * seed a synthetic operation carrying the real landscape journal entry from
+     * the commit above, then roll it back. Its tiles are now covered by the
+     * built station/track, so D4_RestoreLandscape's bounded RaiseTile/LowerTile
+     * attempts cannot succeed — the honest, required outcome is rollback_partial,
+     * not a silent false success or a hang. */
+    const rollbackSeedWire = await client.requestGameScript("execute", {
+      company_id: 0,
+      command: "hub4x7_landscape_partial_rollback_seed_probe",
+      params: { operation_id: "directorate-hub4x7-gate.commit", synthetic_operation_id: "directorate-hub4x7-gate.landscape-rollback-seed", plan_id: "directorate-hub4x7-gate-plan", revision: commitRevision },
+    });
+    assertOk("hub4x7_landscape_partial_rollback_seed_probe", rollbackSeedWire.payload);
+    evidence.steps.push({ name: "hub4x7_landscape_partial_rollback_seed_probe", response: rollbackSeedWire });
+
+    const rollbackAttempt = assertNotOk("hub4x7_landscape_rollback_partial", await request(handlers, "apply", {
+      company_id: 0,
+      plan_id: "directorate-hub4x7-gate-plan",
+      revision: commitRevision,
+      phase: "rollback",
+      operation_id: "directorate-hub4x7-gate.landscape-rollback",
+      target_operation_id: "directorate-hub4x7-gate.landscape-rollback-seed",
+      reserve: 0,
+    }));
+    if (rollbackAttempt.payload?.state !== "rollback_partial" || !(rollbackAttempt.payload?.remaining?.length > 0)) {
+      throw new Error(`hub4x7 landscape rollback against live infrastructure did not honestly report rollback_partial: ${JSON.stringify(rollbackAttempt)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_landscape_rollback_partial", response: rollbackAttempt });
+
+    evidence.steps.push({ name: "hub4x7_save", response: await client.rcon("save directorate_gate_hub4x7") });
+    await client.shutdown();
+  }, { fixture: hub4x7Fixture, gamePort: hub4x7GamePort, logPath: hub4x7LogPath });
+
+  const savePath = join(hub4x7Fixture, "save/directorate_gate_hub4x7.sav");
+  if (!existsSync(savePath)) throw new Error(`hub4x7 save missing: ${savePath}`);
+
+  await withServer(savePath, async () => {
+    const client = new AdminClient({
+      host: "127.0.0.1",
+      port: hub4x7Port,
+      password,
+      name: "directorate real-engine gate hub4x7 restart",
+      version: "0.1.0",
+      requestTimeoutMs,
+      connectTimeoutMs: 10000,
+      pingIntervalMs: 0,
+      reconnect: { enabled: false, maxAttempts: 0, initialDelayMs: 100, maxDelayMs: 100 },
+      maxResponseBytes: 1024 * 1024,
+      maxResponseChunks: 256,
+      maxPendingRequests: 16,
+    });
+    await client.connect();
+    const replayHandlers = createToolHandlers(new AdminOpenTtdGateway(client));
+    evidence.steps.push({ name: "hub4x7_restart_connect", ok: true });
+    await delay(1000);
+
+    const observeAfterRestart = assertOk("hub4x7_observe_routes_after_restart", await request(replayHandlers, "observe", { scope: "routes", company_id: 0, limit: 16 }));
+    const afterRoutes = observeAfterRestart.payload?.routes ?? [];
+    const persistedFirst = afterRoutes.find((route) => route?.route_id === "directorate-hub4x7-gate-route");
+    const persistedSecond = afterRoutes.find((route) => route?.route_id === "directorate-hub4x7-gate-route-second");
+    if (persistedFirst?.state !== "commissioned" || persistedSecond?.state !== "commissioned") {
+      throw new Error(`hub4x7 expected both routes to persist commissioned after restart: ${JSON.stringify(afterRoutes)}`);
+    }
+    evidence.steps.push({ name: "hub4x7_observe_routes_after_restart", response: observeAfterRestart });
+
+    const verifyAfterRestart = assertOk("hub4x7_verify_topology_after_restart", await request(replayHandlers, "verify", { company_id: 0, route_id: "directorate-hub4x7-gate-route", level: "topology" }));
+    if (verifyAfterRestart.payload?.health?.topology_ok !== true) throw new Error(`hub4x7 topology not ok after restart: ${JSON.stringify(verifyAfterRestart)}`);
+    evidence.steps.push({ name: "hub4x7_verify_topology_after_restart", response: verifyAfterRestart });
+
+    await client.shutdown();
+  }, { fixture: hub4x7Fixture, gamePort: hub4x7GamePort, logPath: hub4x7LogPath });
+
+  if (process.env.OPENTTD_GATE_KEEP_FIXTURE !== "1") rmSync(hub4x7Fixture, { recursive: true, force: true });
+}
+
 async function main() {
   writeConfig();
   const evidence = {
@@ -451,20 +1020,25 @@ async function main() {
     source_dirty: gitOutput(["status", "--porcelain"], "").length > 0,
     port,
     game_port: gamePort,
+    hub4x7_fixture: hub4x7Fixture,
+    hub4x7_port: hub4x7Port,
+    hub4x7_game_port: hub4x7GamePort,
     steps: [],
   };
   let planRevision = 0;
   let commitRevision = 0;
   let failed = false;
+  const onlyHub4x7 = process.env.OPENTTD_GATE_ONLY_HUB4X7 === "1";
   try {
-    await withServer(null, async () => {
+    if (!onlyHub4x7) {
+    await withPhaseDeadline("initial_server", () => withServer(null, async () => {
       const client = new AdminClient({
         host: "127.0.0.1",
         port,
         password,
         name: "directorate real-engine gate",
         version: "0.1.0",
-        requestTimeoutMs: 600000,
+        requestTimeoutMs,
         connectTimeoutMs: 10000,
         pingIntervalMs: 0,
         reconnect: { enabled: false, maxAttempts: 0, initialDelayMs: 100, maxDelayMs: 100 },
@@ -732,19 +1306,19 @@ async function main() {
 
       evidence.steps.push({ name: "save", response: await client.rcon("save directorate_gate") });
       await client.shutdown();
-    });
+    }));
 
     const savePath = join(fixture, "save/directorate_gate.sav");
     if (!existsSync(savePath)) throw new Error(`save missing: ${savePath}`);
 
-    await withServer(savePath, async () => {
+    await withPhaseDeadline("restart_server", () => withServer(savePath, async () => {
       const client = new AdminClient({
         host: "127.0.0.1",
         port,
         password,
         name: "directorate real-engine gate restart",
         version: "0.1.0",
-        requestTimeoutMs: 600000,
+        requestTimeoutMs,
         connectTimeoutMs: 10000,
         pingIntervalMs: 0,
         reconnect: { enabled: false, maxAttempts: 0, initialDelayMs: 100, maxDelayMs: 100 },
@@ -823,8 +1397,11 @@ async function main() {
 	  }));
 	  if (rollbackProbe.payload?.remaining?.length !== 0) throw new Error(`deferred rollback did not complete: ${JSON.stringify(rollbackProbe)}`);
 	  evidence.steps.push({ name: "load_budget_probe_rollback", response: rollbackProbe });
-      await client.shutdown();
-    });
+	  await client.shutdown();
+	  }));
+	  }
+
+	  await withPhaseDeadline("terrain_obstructed_hub4x7", () => runTerrainObstructedHub4x7Fixture(evidence));
   } catch (error) {
     failed = true;
     evidence.steps.push({ name: "blocked_or_failed", message: error instanceof Error ? error.message : String(error) });

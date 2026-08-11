@@ -2,6 +2,7 @@ export interface GatewayResponse<TPayload = unknown> {
   readonly correlation_id: string;
   readonly ok: boolean;
   readonly payload: TPayload;
+  readonly error?: unknown;
 }
 
 export interface ObserveRequest {

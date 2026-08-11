@@ -68,6 +68,7 @@ export class AdminOpenTtdGateway implements OpenTtdGateway {
       correlation_id: response.correlation_id,
       ok: response.payload.ok,
       payload: "payload" in response.payload ? response.payload.payload : response.payload,
+      error: "error" in response.payload ? response.payload.error : undefined,
     };
   }
 }

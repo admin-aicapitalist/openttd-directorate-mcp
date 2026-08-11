@@ -246,7 +246,7 @@ test("Single-shuttle routing uses the real station tiles as endpoint context", (
   assert.match(program, /first_rail\.prev = source_station\.tile/);
   assert.match(program, /last_rail\.next = destination_station\.tile/);
   assert.match(store, /if \(D4_UpgradeBuildProgram\(plan\)\)/);
-  assert.match(version, /DIRECTORATE_M4_BUILD_PROGRAM_VERSION <- 3/);
+  assert.match(version, /DIRECTORATE_M4_BUILD_PROGRAM_VERSION <- 5/);
   const gate = readFileSync("tests/integration/directorate-real-engine-gate.mjs", "utf8");
   assert.match(gate, /migration_safety_probe/);
   assert.match(gate, /all_rejected/);
@@ -277,7 +277,7 @@ test("Single-shuttle curve-run contract rejects observed one-tile jog and stairc
   assert.match(program, /function D4_HasMinimumCurveRun\(path, min_turn_run\)/);
   assert.match(program, /dogleg\.ok && D4_HasMinimumCurveRun\(dogleg\.path, min_turn_run\)/);
   assert.match(program, /turn_cost_override, min_turn_run, false\)/);
-  assert.match(program, /curve_run_approach_out_of_map/);
+  assert.match(program, /Fast approach extension is an optimisation only/);
   assert.match(program, /candidate\.ok && D4_HasMinimumCurveRun\(candidate\.path, min_turn_run\)/);
 });
 
@@ -337,6 +337,21 @@ test("Paired corridor connects through-hub endpoints through common fan and merg
   assert.match(program, /through_hub_paired_lane_endpoint_mismatch/);
   assert.match(program, /through_hub_source_exit_heading_mismatch/);
   assert.match(program, /through_hub_destination_exit_heading_mismatch/);
+  // D4_CompileThroughHubRoroProgram's own endpoint-heading guard mirrors the
+  // selector's admissible-heading rule: reject only the exact U-turn, not any
+  // heading that isn't the dominant direction.
+  assert.match(program, /if \(source_manifest\.manifest\.loop_exit_heading == D4_RotateDir\(source_to_dest, 2\)\) return \{ ok = false, error = D4_Error\("through_hub_source_exit_heading_mismatch"/);
+  assert.match(program, /if \(dest_manifest\.manifest\.loop_exit_heading == D4_RotateDir\(dest_to_source, 2\)\) return \{ ok = false, error = D4_Error\("through_hub_destination_exit_heading_mismatch"/);
+  assert.doesNotMatch(program, /if \(source_manifest\.manifest\.loop_exit_heading != source_to_dest\) return/);
+  assert.doesNotMatch(program, /if \(dest_manifest\.manifest\.loop_exit_heading != dest_to_source\) return/);
+  // A through-hub return lane departs the destination at the destination's
+  // loop_exit_heading but arrives at the source at the source's
+  // fan_entry_heading -- independent endpoint properties that only ever
+  // numerically coincided under the old hard-equality pairing gate. The rail
+  // buildability probe must validate each end against its own heading.
+  assert.match(program, /function D4_ValidateCenterlineCandidate\(path, company_id, required_start_heading, required_end_heading = -1\)/);
+  assert.match(program, /if \(required_end_heading < 0\) required_end_heading = required_start_heading;/);
+  assert.match(program, /D4_ValidateCenterlineCandidate\(candidate\.return_lane, plan\.company_id, dest_manifest\.manifest\.loop_exit_heading, source_manifest\.manifest\.fan_entry_heading\)/);
   assert.match(program, /source_manifest\.manifest\.loop_exit_heading/);
   assert.match(program, /dest_manifest\.manifest\.fan_entry_heading, 4, 50, turn_clearance, true, dest_out, source_in, dest_manifest\.manifest\.loop_exit_heading, source_manifest\.manifest\.fan_entry_heading\)/);
   assert.match(program, /local turn_clearance = source_manifest\.manifest\.platform_length/);
@@ -366,7 +381,9 @@ test("Paired corridor connects through-hub endpoints through common fan and merg
   assert.match(program, /fingerprint = D4_BoundedFingerprint\(\{ topology = topology/);
   assert.match(program, /function D4_SelectBestSitePair\(source_candidates, destination_candidates, excluded = null\)/);
   assert.match(program, /pair_key in excluded/);
-  assert.match(program, /source_layout\.loop_exit_heading != source_to_destination/);
+  assert.match(program, /source_layout\.loop_exit_heading != source_to_destination\) orientation_penalty/);
+  assert.match(program, /source_layout\.loop_exit_heading == D4_RotateDir\(source_to_destination, 2\)\) continue/);
+  assert.match(program, /destination_layout\.loop_exit_heading == D4_RotateDir\(destination_to_source, 2\)\) continue/);
   assert.match(program, /if \(!paired_ports\) continue/);
   assert.doesNotMatch(program, /if \(!paired_ports\) orientation_penalty/);
   assert.match(program, /function D4_VerifyThroughHubEndpointTopology/);
@@ -438,6 +455,28 @@ test("Planning input rejects tile lists and path inputs", () => {
   assert.match(util, /"path"/);
   assert.match(util, /"waypoints"/);
   assert.match(store, /D4_ContainsForbiddenPlanningInput/);
+});
+
+test("Landscaping program owns inner terrain, preserves the halo, prices it, and restores bounded snapshots", () => {
+  const program = readFileSync(join(gameDir, "build_program.nut"), "utf8");
+  const journal = readFileSync(join(gameDir, "operation_journal.nut"), "utf8");
+  const version = readFileSync(join(gameDir, "version.nut"), "utf8");
+  assert.match(program, /inner = x >= minx && x <= maxx && y >= miny && y <= maxy/);
+  assert.match(program, /local is_owned = corner_x\[i\] >= minx/);
+  assert.match(program, /corners\.append\(\{ tile=tile, h=hs, inner=inner, owned=owned \}\)/);
+  assert.match(program, /function D4_LandscapeReadback/);
+  assert.match(program, /!after\[i\]\.owned\[c\] && before\[i\]\.h\[c\] != after\[i\]\.h\[c\]/);
+  assert.match(program, /GSTile\.LevelTiles\(op\.tile, op\.end_tile\)/);
+  assert.match(program, /GSTile\.GetBuildCost\(GSTile\.BT_TERRAFORM\)/);
+  assert.match(program, /GSCompany\.GetBankBalance\(company_id\)/);
+  assert.match(program, /DIRECTORATE_M4_MAX_LANDSCAPE_(OPERATIONS|TILES|RECTANGLE_AREA|HEIGHT_DELTA|COST)/);
+  assert.match(version, /DIRECTORATE_M4_MAX_LANDSCAPE_TILES <- 640/);
+  assert.match(journal, /function D4_IsSafeLandscapeCornerRecord/);
+  assert.match(journal, /record\.h\.len\(\) != 4/);
+  assert.match(journal, /function D4_RestoreLandscape/);
+  assert.match(journal, /GSTile\.(RaiseTile|LowerTile)/);
+  assert.match(journal, /DIRECTORATE_M4_MAX_LANDSCAPE_RESTORE_STEPS/);
+  assert.match(journal, /if \(GSTile\.GetCornerHeight\(record\.tile, corner\) != target\) return false/);
 });
 
 test("Operation journal keeps durable idempotent request/replay contracts", () => {
