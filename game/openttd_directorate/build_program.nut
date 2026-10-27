@@ -194,6 +194,7 @@ function D4_CompileThroughHubRoroProgram(plan, source_station, destination_stati
 	local depot = D4_DepotOperation(returned.return_lane, occupied, true, "exit_to_next");
 	if (depot.ok) {
 		ops.append(depot.access_op);
+		ops.append(depot.entry_op);
 		ops.append(depot.op);
 	}
 	local signals_enabled = true;
@@ -888,8 +889,14 @@ function D4_DepotOperation(path, occupied = null, prefer_tail = false, access_mo
 				access_next = next;
 			}
 			if (!D4_IsLegalPrimitive(access_prev, front, access_next)) continue;
+			/* tamago fork: an exit-only siding cannot be entered from the one-way
+			 * lane, yet every train gets a service order for this depot; trains then
+			 * circled forever, lost, skipping their stations. Add the entry curve. */
+			if (access_mode == "exit_to_next" && !D4_IsLegalPrimitive(a, front, depot_point)) continue;
 			local access_op = { op_id = "rail.depot_access.0", kind = "rail_connection", tile = D4_ToTile(front), point = front, prev = D4_ToTile(access_prev), prev_point = access_prev, next = D4_ToTile(access_next), next_point = access_next };
-			return { ok = true, access_op = access_op, op = { op_id = "depot.0", kind = "depot", tile = D4_ToTile(depot_point), point = depot_point, front = D4_ToTile(front), front_point = front } };
+			local result = { ok = true, access_op = access_op, op = { op_id = "depot.0", kind = "depot", tile = D4_ToTile(depot_point), point = depot_point, front = D4_ToTile(front), front_point = front } };
+			if (access_mode == "exit_to_next") result.entry_op <- { op_id = "rail.depot_access.1", kind = "rail_connection", tile = D4_ToTile(front), point = front, prev = D4_ToTile(a), prev_point = a, next = D4_ToTile(depot_point), next_point = depot_point };
+			return result;
 		}
 	}
 	return { ok = false };

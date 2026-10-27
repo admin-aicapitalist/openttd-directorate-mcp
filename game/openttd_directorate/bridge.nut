@@ -185,6 +185,74 @@ class DirectorateM4Bridge {
 			}
 			return { ok = true, payload = { loan = GSCompany.GetLoanAmount(), bank_balance = GSCompany.GetBankBalance(payload.company_id), game_max_loan = maximum, interval = interval } };
 		}
+		/* tamago fork: give an already built exit-only depot siding its entry curve
+		 * (see D4_DepotOperation), so trains can reach their service depot. */
+		if (payload.command == "repair_depot_access") {
+			if (!("params" in payload) || !D4_IsTable(payload.params) || !("plan_id" in payload.params) || typeof payload.params.plan_id != "string") return { ok = false, error = D4_Error("invalid_repair", "") };
+			local plan = this.store.GetPlan(payload.params.plan_id);
+			if (plan == null || plan.company_id != payload.company_id || !D4_Has(plan, "build_program") || !D4_Has(plan.build_program, "ops")) return { ok = false, error = D4_Error("plan_not_found", payload.params.plan_id) };
+			local access = null;
+			local depot = null;
+			foreach (op in plan.build_program.ops) {
+				if (!D4_IsTable(op) || !D4_Has(op, "op_id")) continue;
+				if (op.op_id == "rail.depot_access.0") access = op;
+				if (op.op_id == "depot.0") depot = op;
+			}
+			if (access == null || depot == null) return { ok = false, error = D4_Error("depot_not_in_plan", payload.params.plan_id) };
+			local fx = GSMap.GetTileX(access.tile), fy = GSMap.GetTileY(access.tile);
+			local entry = GSMap.GetTileIndex(2 * fx - GSMap.GetTileX(access.next), 2 * fy - GSMap.GetTileY(access.next));
+			if (access.prev != depot.tile) return { ok = false, error = D4_Error("depot_not_exit_only", payload.params.plan_id) };
+			local mode = GSCompanyMode(payload.company_id);
+			if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", payload.company_id.tostring()) };
+			if (!D4_SelectRailType()) return { ok = false, error = D4_Error("rail_type_unavailable", "") };
+			local money_before = GSCompany.GetBankBalance(payload.company_id);
+			if (!GSRail.AreTilesConnected(entry, access.tile, depot.tile) && !GSRail.BuildRail(entry, access.tile, depot.tile)) {
+				return { ok = false, error = D4_Error("repair_failed", GSError.GetLastErrorString()) };
+			}
+			return { ok = true, payload = { plan_id = payload.params.plan_id, front = [fx, fy], connected = GSRail.AreTilesConnected(entry, access.tile, depot.tile), cost = money_before - GSCompany.GetBankBalance(payload.company_id) } };
+		}
+		/* tamago fork: read-only probe of the rail, signals and one train in a map
+		 * rectangle, for diagnosing routes a train cannot reach. */
+		if (payload.command == "inspect_area") {
+			local p = D4_Has(payload, "params") && D4_IsTable(payload.params) ? payload.params : {};
+			if (!D4_Has(p, "x0") || !D4_Has(p, "y0") || !D4_Has(p, "x1") || !D4_Has(p, "y1")) return { ok = false, error = D4_Error("invalid_area", "") };
+			local dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+			local tiles = [];
+			for (local y = p.y0; y <= p.y1 && tiles.len() < 1500; y++) {
+				for (local x = p.x0; x <= p.x1; x++) {
+					local t = GSMap.GetTileIndex(x, y);
+					if (!GSMap.IsValidTile(t) || (!GSRail.IsRailTile(t) && !GSRail.IsRailDepotTile(t))) continue;
+					local e = { x = x, y = y, tracks = GSRail.GetRailTracks(t) };
+					if (GSRail.IsRailStationTile(t)) e.station <- GSStation.GetStationID(t);
+					if (GSRail.IsRailDepotTile(t)) {
+						local f = GSRail.GetRailDepotFrontTile(t);
+						e.depot_front <- [GSMap.GetTileX(f), GSMap.GetTileY(f)];
+					}
+					if (GSBridge.IsBridgeTile(t)) e.bridge <- true;
+					if (GSTunnel.IsTunnelTile(t)) e.tunnel <- true;
+					local signals = [];
+					foreach (d in dirs) {
+						local s = GSRail.GetSignalType(t, GSMap.GetTileIndex(x + d[0], y + d[1]));
+						if (s != GSRail.SIGNALTYPE_NONE) signals.append([d[0], d[1], s]);
+					}
+					if (signals.len() > 0) e.signals <- signals;
+					tiles.append(e);
+				}
+			}
+			local vehicles = [];
+			if (D4_Has(p, "vehicle_id") && GSVehicle.IsValidVehicle(p.vehicle_id)) {
+				local v = p.vehicle_id;
+				local loc = GSVehicle.GetLocation(v);
+				local orders = [];
+				for (local i = 0; i < GSOrder.GetOrderCount(v); i++) {
+					local dst = GSOrder.GetOrderDestination(v, i);
+					orders.append({ x = GSMap.GetTileX(dst), y = GSMap.GetTileY(dst), flags = GSOrder.GetOrderFlags(v, i) });
+				}
+				vehicles.append({ id = v, x = GSMap.GetTileX(loc), y = GSMap.GetTileY(loc), state = GSVehicle.GetState(v),
+					speed = GSVehicle.GetCurrentSpeed(v), current = GSOrder.ResolveOrderPosition(v, GSOrder.ORDER_CURRENT), orders = orders });
+			}
+			return { ok = true, payload = { tiles = tiles, vehicles = vehicles } };
+		}
 		return { ok = false, error = D4_Error("unknown_command", payload.command) };
 	}
 
