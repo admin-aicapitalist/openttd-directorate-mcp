@@ -164,6 +164,27 @@ class DirectorateM4Bridge {
 			local role = D4_Has(payload.params, "role") ? payload.params.role : "source";
 			return D4_SurveyStationSites(payload.company_id, payload.params.industry_id, role, payload.params.template, {}, policy);
 		}
+		/* tamago fork: let the operating agent borrow and repay like a player. The harness
+		 * caps borrowing with params.max_fraction (share of the game's maximum loan). */
+		if (payload.command == "loan_status" || payload.command == "set_loan") {
+			local mode = GSCompanyMode(payload.company_id);
+			if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", payload.company_id.tostring()) };
+			local maximum = GSCompany.GetMaxLoanAmount();
+			local interval = GSCompany.GetLoanInterval();
+			if (payload.command == "set_loan") {
+				if (!("params" in payload) || !D4_IsTable(payload.params) || !("amount" in payload.params) || typeof payload.params.amount != "integer") return { ok = false, error = D4_Error("invalid_loan_amount", "") };
+				local fraction = D4_Has(payload.params, "max_fraction") && typeof payload.params.max_fraction == "integer" ? payload.params.max_fraction : 100;
+				local cap = maximum / 100 * D4_ClampInt(fraction, 100, 0, 100);
+				cap = cap - cap % interval;
+				local target = D4_ClampInt(payload.params.amount, 0, 0, cap);
+				target = ((target + interval - 1) / interval) * interval;
+				if (target > cap) target = cap;
+				if (target != GSCompany.GetLoanAmount() && !GSCompany.SetLoanAmount(target)) {
+					return { ok = false, error = D4_Error("loan_change_refused", target.tostring()), payload = { loan = GSCompany.GetLoanAmount(), bank_balance = GSCompany.GetBankBalance(payload.company_id), allowed_max = cap } };
+				}
+			}
+			return { ok = true, payload = { loan = GSCompany.GetLoanAmount(), bank_balance = GSCompany.GetBankBalance(payload.company_id), game_max_loan = maximum, interval = interval } };
+		}
 		return { ok = false, error = D4_Error("unknown_command", payload.command) };
 	}
 

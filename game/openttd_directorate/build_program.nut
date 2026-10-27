@@ -662,8 +662,8 @@ function D4_BuildLegalCenterline(start, goal, company_id, policy, required_start
 	 * candidate primitive is tested by OpenTTD; no client-supplied path is
 	 * accepted and no map mutation occurs. */
 	local max_len = D4_ClampInt(D4_Has(policy, "path_limit") ? policy.path_limit : 160, 160, 8, 384);
-	local expansion_limit = D4_ClampInt(D4_Has(policy, "route_expansion_limit") ? policy.route_expansion_limit : 768, 768, 32, 32768);
-	local frontier_limit = D4_ClampInt(D4_Has(policy, "route_frontier_limit") ? policy.route_frontier_limit : 4096, 4096, 128, 32768);
+	local expansion_limit = D4_ClampInt(D4_Has(policy, "route_expansion_limit") ? policy.route_expansion_limit : 768, 768, 32, 131072); // tamago fork: cap was 32768
+	local frontier_limit = D4_ClampInt(D4_Has(policy, "route_frontier_limit") ? policy.route_frontier_limit : 4096, 4096, 128, 131072); // tamago fork: cap was 32768
 	local initial_dir = required_start_dir >= 0 ? required_start_dir : (abs(goal.x - start.x) >= abs(goal.y - start.y) ? (goal.x >= start.x ? DIR_NE : DIR_SW) : (goal.y >= start.y ? DIR_SE : DIR_NW));
 	local initial_h = (abs(goal.x - start.x) + abs(goal.y - start.y)) * 10;
 	local track_run_state = min_turn_run > 0;
