@@ -64,10 +64,13 @@ export class AdminOpenTtdGateway implements OpenTtdGateway {
         payload: { error: "invalid_gamescript_response", detail: "Correlated GameScript response must contain an explicit boolean ok field" },
       };
     }
+    const inner = "payload" in response.payload ? response.payload.payload : response.payload;
+    // Keep the GameScript's error next to the payload; dropping it leaves callers with ok:false and no reason.
+    const error = response.payload.error;
     return {
       correlation_id: response.correlation_id,
       ok: response.payload.ok,
-      payload: "payload" in response.payload ? response.payload.payload : response.payload,
+      payload: error !== undefined && error !== null && isRecord(inner) && !("error" in inner) ? { ...inner, error } : inner,
     };
   }
 }

@@ -114,7 +114,7 @@ class DirectorateM4Bridge {
 		}
 		if (targets != 1) return { ok = false, error = D4_Error("invalid_verify_target", "exactly one target required") };
 		local level = D4_Has(payload, "level") && typeof payload.level == "string" ? payload.level : "topology";
-		if (D4_Has(payload, "route_id")) return this.store.Verify(payload.company_id, payload.route_id, level);
+		if (D4_Has(payload, "route_id")) return this.store.Verify(payload.company_id, payload.route_id, level, false, true);
 		if (D4_Has(payload, "plan_id")) return this.store.Verify(payload.company_id, payload.plan_id, level);
 		return this.store.Verify(payload.company_id, payload.operation_id, level, true);
 	}

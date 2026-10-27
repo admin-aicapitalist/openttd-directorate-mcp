@@ -309,8 +309,14 @@ class DirectorateM4PlanStore {
 		return { ok = true, payload = { scope = scope, plans = rows, tick = D4_Tick() } };
 	}
 
-	function Verify(company_id, plan_or_route_id, level, is_operation_id = false) {
+	function Verify(company_id, plan_or_route_id, level, is_operation_id = false, prefer_route = false) {
 		if (is_operation_id) return this.VerifyOperation(company_id, plan_or_route_id, level);
+		/* tamago fork: a route_id that equals its plan_id used to resolve to the plan, so the
+		 * route could never be checked for topology, vehicles or revenue. */
+		if (prefer_route && this.registry.Get(plan_or_route_id) != null) {
+			local routed = D4_VerifyRoute(this.registry, plan_or_route_id, company_id, level);
+			return { ok = routed.ok, payload = routed, error = D4_Has(routed, "error") ? routed.error : null };
+		}
 		local plan = this.GetPlan(plan_or_route_id);
 		if (plan != null) {
 			if (plan.company_id != company_id) return { ok = false, error = D4_Error("company_mismatch", plan_or_route_id) };
