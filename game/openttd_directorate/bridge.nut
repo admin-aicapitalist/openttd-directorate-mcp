@@ -200,7 +200,18 @@ class DirectorateM4Bridge {
 	function SendPrepared(response) {
 		local json = D4_JsonEncode(response);
 		if (json.len() > DIRECTORATE_M4_MAX_RESPONSE_JSON_BYTES) {
-			response = { request_id = response.request_id, ok = false, error = D4_Error("response_too_large", json.len().tostring()), payload = {} };
+			/* tamago fork: keep the real outcome and the scalar summary fields; only drop
+			 * bulky detail. Reporting ok=false here made successful builds look failed. */
+			local summary = { truncated = true, full_bytes = json.len() };
+			if (D4_Has(response, "payload") && D4_IsTable(response.payload)) {
+				foreach (key, value in response.payload) {
+					local kind = typeof value;
+					if (kind == "integer" || kind == "string" || kind == "bool" || kind == "float") summary[key] <- value;
+				}
+			}
+			local compact = { request_id = response.request_id, ok = response.ok, payload = summary };
+			if (D4_Has(response, "error")) compact.error <- response.error;
+			response = compact;
 			json = D4_JsonEncode(response);
 		}
 		local count = ((json.len() + DIRECTORATE_M4_CHUNK_BYTES - 1) / DIRECTORATE_M4_CHUNK_BYTES).tointeger();
