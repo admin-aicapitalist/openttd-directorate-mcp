@@ -273,3 +273,11 @@ test("through-hub endpoint manifest emits per-row entries whose paths originate 
   assert.match(build, /reachability_platform_rear_unreachable/);
   assert.match(build, /reachability_common_outbound_unreachable/);
 });
+
+test("plan store requires the RoRo topology only for paired through-hub plans, not single-track ones", () => {
+  const store = readFileSync("game/openttd_directorate/plan_store.nut", "utf8");
+  const build = readFileSync("game/openttd_directorate/build_program.nut", "utf8");
+  assert.match(build, /local paired_mode = !single_shuttle && !initial_single_track;/);
+  assert.match(store, /local single_track = D4_Has\(plan\.policy, "initial_single_track"\) && plan\.policy\.initial_single_track == true;/);
+  assert.match(store, /D4_IsThroughHubBlueprint\(plan\.station_blueprint\) && !single_track && \(!D4_Has\(plan\.build_program, "topology"\)/);
+});

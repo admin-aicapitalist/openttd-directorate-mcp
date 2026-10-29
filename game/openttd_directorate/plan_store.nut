@@ -395,7 +395,10 @@ class DirectorateM4PlanStore {
 				if (!D4_IsArray(plan.build_program.return_lane) || plan.build_program.return_lane.len() > DIRECTORATE_M4_MAX_OPERATION_ENTRIES) return false;
 
 			}
-			if (plan.build_program.version == DIRECTORATE_M4_BUILD_PROGRAM_VERSION && D4_IsThroughHubBlueprint(plan.station_blueprint) && (!D4_Has(plan.build_program, "topology") || !D4_IsSafeThroughHubTopology(plan.build_program.topology))) return false;
+			/* Single-track through-hub plans compile a plain lane program without the RoRo topology
+			 * (see paired_mode in build_program.nut); requiring it hid every such plan as unsafe. */
+			local single_track = D4_Has(plan.policy, "initial_single_track") && plan.policy.initial_single_track == true;
+			if (plan.build_program.version == DIRECTORATE_M4_BUILD_PROGRAM_VERSION && D4_IsThroughHubBlueprint(plan.station_blueprint) && !single_track && (!D4_Has(plan.build_program, "topology") || !D4_IsSafeThroughHubTopology(plan.build_program.topology))) return false;
 			if (validate_program) {
 				local validation = D4_ValidateBuildProgram(plan.build_program.ops);
 				if (!validation.ok) return false;
