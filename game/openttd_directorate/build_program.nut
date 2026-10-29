@@ -24,8 +24,8 @@ function D4_CompileBuildProgram(plan) {
 	 * shuttle, preserve the actual station tiles as the predecessor/successor
 	 * context in the emitted endpoint primitives.  Apply preflight tests those
 	 * exact primitives before any mutation. */
-	local source_entry = single_shuttle ? source_station.op.point : D4_NearestBlueprintPortPoint(plan.station_blueprint, "platform_body", start);
-	local destination_exit = single_shuttle ? destination_station.op.point : D4_NearestBlueprintPortPoint(plan.destination_blueprint, "platform_body", goal);
+	local source_entry = D4_NearestBlueprintPortPoint(plan.station_blueprint, "platform_body", start);
+	local destination_exit = D4_NearestBlueprintPortPoint(plan.destination_blueprint, "platform_body", goal);
 	if (source_entry == null || destination_exit == null) return { ok = false, error = D4_Error("program_missing_station_entries", "") };
 	local required_start_dir = D4_DirectionBetween(source_entry, start);
 	local required_goal_dir = D4_DirectionBetween(goal, destination_exit);
