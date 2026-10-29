@@ -253,6 +253,16 @@ class DirectorateM4Bridge {
 			}
 			return { ok = true, payload = { tiles = tiles, vehicles = vehicles } };
 		}
+		/* tamago fork: road, water and air routes and fleet care (vehicles.nut). */
+		if (payload.command in DIRECTORATE_VEHICLE_COMMANDS) {
+			local vparams = D4_Has(payload, "params") && D4_IsTable(payload.params) ? payload.params : {};
+			/* A script error would stop the whole GameScript; report it as a failed command instead. */
+			try {
+				return DIRECTORATE_VEHICLE_COMMANDS[payload.command](this.store, payload.company_id, vparams);
+			} catch (e) {
+				return { ok = false, error = D4_Error("script_error", D4_StringOr("" + e, "", 80)) };
+			}
+		}
 		/* tamago fork: what the stream camera director is doing. */
 		if (payload.command == "camera_status") return { ok = true, payload = D4_Camera == null ? {} : D4_Camera.Status() };
 		return { ok = false, error = D4_Error("unknown_command", payload.command) };

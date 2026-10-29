@@ -132,6 +132,7 @@ class DirectorateM4RouteRegistry {
 			route_id = route.route_id,
 			company_id = route.company_id,
 			plan_id = route.plan_id,
+			mode = D4_Has(route, "mode") ? route.mode : "rail",
 			state = route.state,
 			cargo_type = route.cargo_type,
 			cargo_label = route.cargo_label,
@@ -350,6 +351,14 @@ function D4_CommissionRoute(plan_store, registry, company_id, plan_id, route_id,
 
 function D4_VerifyRouteTopology(route, company_id) {
 	local failures = [];
+	/* tamago fork: road, water and air routes have no track to check, only their two stations. */
+	if (D4_Has(route, "mode") && route.mode != "rail") {
+		foreach (which, tile in { source = route.source_station_tile, destination = route.destination_station_tile }) {
+			local station = GSStation.GetStationID(tile);
+			if (!GSStation.IsValidStation(station) || GSStation.GetOwner(station) != company_id) failures.append({ reason = which + "_station_missing", tile = tile });
+		}
+		return { ok = failures.len() == 0, failures = failures };
+	}
 	if (!GSRail.IsRailStationTile(route.source_station_tile) || GSTile.GetOwner(route.source_station_tile) != company_id) failures.append({ reason = "source_station_missing", tile = route.source_station_tile });
 	if (!GSRail.IsRailStationTile(route.destination_station_tile) || GSTile.GetOwner(route.destination_station_tile) != company_id) failures.append({ reason = "destination_station_missing", tile = route.destination_station_tile });
 	local connected = D4_AreStationsConnectedByRail(route.source_station_tile, route.destination_station_tile, company_id);

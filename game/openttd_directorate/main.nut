@@ -11,6 +11,7 @@ require("plan_store.nut");
 require("route_registry.nut");
 require("bridge.nut");
 require("director.nut");
+require("vehicles.nut");
 
 class OpenTTDDirectorate extends GSController {
 	bridge = null;

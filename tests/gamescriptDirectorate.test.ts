@@ -430,3 +430,30 @@ test("Camera director moves only the stream camera client, sweeping builds and f
   assert.match(journal, /if \(!built\.reused && D4_Camera != null\) D4_Camera\.Building\(program_op\.tile\)/);
   assert.match(registry, /D4_Camera\.Feature\(vehicle_id\)/);
 });
+
+test("Road, water and air routes build in one command and register with their mode", () => {
+  const vehicles = readFileSync(join(gameDir, "vehicles.nut"), "utf8");
+  const bridge = readFileSync(join(gameDir, "bridge.nut"), "utf8");
+  const main = readFileSync(join(gameDir, "main.nut"), "utf8");
+  const registry = readFileSync(join(gameDir, "route_registry.nut"), "utf8");
+  for (const command of ["build_road_route", "build_ship_route", "build_air_route", "add_vehicle", "list_towns",
+    "list_vehicles", "set_autorenew"]) {
+    assert.match(vehicles, new RegExp(`^\\t${command} = `, "m"));
+  }
+  assert.doesNotMatch(vehicles, /debug_/);
+  // A script error in these commands is caught, not left to stop the whole GameScript.
+  assert.match(bridge, /payload\.command in DIRECTORATE_VEHICLE_COMMANDS/);
+  assert.match(bridge, /catch \(e\)[\s\S]*script_error/);
+  assert.match(main, /require\("vehicles\.nut"\)/);
+  // Squirrel 2.2: no closures over locals and no built-in min/max.
+  assert.doesNotMatch(vehicles, /[^_]\bmax\(|[^_]\bmin\(/);
+  assert.doesNotMatch(vehicles, /local \w+ = function/);
+  // Roads never cross railway; failed builds are undone; every build can be a dry run.
+  assert.match(vehicles, /GSRail\.IsLevelCrossingTile\(tile\) \|\| GSRail\.IsRailTile\(tile\)/);
+  assert.match(vehicles, /function D4_UndoBuilt\(built\)/);
+  assert.match(vehicles, /function D4_FindWaterPath\(/);
+  assert.equal((vehicles.match(/params\.dry_run == true/g) ?? []).length, 3);
+  assert.match(vehicles, /route\.mode <- mode/);
+  assert.match(registry, /route\.mode != "rail"/);
+  assert.match(registry, /mode = D4_Has\(route, "mode"\) \? route\.mode : "rail"/);
+});
