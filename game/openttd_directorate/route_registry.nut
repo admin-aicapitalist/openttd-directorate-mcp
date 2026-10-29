@@ -286,6 +286,7 @@ function D4_AssignVehicleToRoute(route, vehicle_id, build_cost) {
 	route.vehicles.append({ vehicle_id = vehicle_id, created_tick = D4_Tick(), build_cost = build_cost });
 	route.economics.build_cost += build_cost;
 	route.updated_tick = D4_Tick();
+	if (D4_Camera != null) D4_Camera.Feature(vehicle_id);
 	return { ok = true, vehicle_id = vehicle_id };
 }
 

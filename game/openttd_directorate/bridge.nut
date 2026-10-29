@@ -253,6 +253,8 @@ class DirectorateM4Bridge {
 			}
 			return { ok = true, payload = { tiles = tiles, vehicles = vehicles } };
 		}
+		/* tamago fork: what the stream camera director is doing. */
+		if (payload.command == "camera_status") return { ok = true, payload = D4_Camera == null ? {} : D4_Camera.Status() };
 		return { ok = false, error = D4_Error("unknown_command", payload.command) };
 	}
 

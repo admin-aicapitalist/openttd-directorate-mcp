@@ -10,6 +10,7 @@ require("operation_journal.nut");
 require("plan_store.nut");
 require("route_registry.nut");
 require("bridge.nut");
+require("director.nut");
 
 class OpenTTDDirectorate extends GSController {
 	bridge = null;
@@ -24,6 +25,7 @@ class OpenTTDDirectorate extends GSController {
 function OpenTTDDirectorate::Start() {
 	if (this.store == null) this.store = DirectorateM4PlanStore();
 	if (this.bridge == null) this.bridge = DirectorateM4Bridge(this.store);
+	if (::D4_Camera == null) ::D4_Camera = DirectorateCamera();
 	if (this.pending_load != null) {
 		this.store.BeginLoad(this.pending_load);
 		this.pending_load = null;
@@ -35,6 +37,7 @@ function OpenTTDDirectorate::Start() {
 	while (true) {
 		this.store.Tick();
 		this.bridge.Poll();
+		::D4_Camera.Tick();
 		GSController.Sleep(1);
 	}
 }

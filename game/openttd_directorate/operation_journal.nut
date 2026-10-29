@@ -406,6 +406,7 @@ function D4_CommitOperation(plan, store, journal, company_id, reserve, op) {
 			local failed2 = { ok = false, error = D4_Error("build_failed", program_op.op_id), operation_id = op.operation_id, state = op.state, failed_op = program_op.op_id, failure = built.failure, rollback = rollback_result2, remaining = rollback_result2.remaining };
 			return failed2;
 		}
+		if (!built.reused && D4_Camera != null) D4_Camera.Building(program_op.tile);
 		total_cost += built.cost;
 		local entry_kind = built.reused ? "reused" : "created";
 		if (!journal.Record(op, entry_kind, program_op.tile, built.detail)) {

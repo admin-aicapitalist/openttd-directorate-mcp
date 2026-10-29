@@ -414,3 +414,19 @@ test("TS contracts expose commission request and bounded verify schema", () => {
   assert.match(schemas, /verify requires exactly one of route_id, plan_id, or operation_id/);
   assert.match(schemas, /level: z\.enum\(\["topology", "commissioning", "economic"\]\)/);
 });
+
+test("Camera director moves only the stream camera client, sweeping builds and following vehicles", () => {
+  const director = readFileSync(join(gameDir, "director.nut"), "utf8");
+  const main = readFileSync(join(gameDir, "main.nut"), "utf8");
+  const journal = readFileSync(join(gameDir, "operation_journal.nut"), "utf8");
+  const registry = readFileSync(join(gameDir, "route_registry.nut"), "utf8");
+  assert.match(director, /DIRECTORATE_CAMERA_CLIENT <- "TamagoCam"/);
+  assert.match(director, /GSViewport\.ScrollClientTo\(client, tile\)/);
+  assert.doesNotMatch(director, /ScrollEveryoneTo|ScrollCompanyClientsTo/);
+  assert.doesNotMatch(director, /GSCompanyMode\(/);
+  assert.match(director, /this\.sweep\.append\(tile\)/);
+  assert.match(main, /require\("director\.nut"\)/);
+  assert.match(main, /::D4_Camera\.Tick\(\)/);
+  assert.match(journal, /if \(!built\.reused && D4_Camera != null\) D4_Camera\.Building\(program_op\.tile\)/);
+  assert.match(registry, /D4_Camera\.Feature\(vehicle_id\)/);
+});
