@@ -578,13 +578,13 @@ function D4_AddRouteVehicles(store, company_id, params) {
 	if (route == null || route.company_id != company_id) return { ok = false, error = D4_Error("route_not_found", params.route_id) };
 	if (!D4_Has(route, "mode") || route.mode == "rail") return { ok = false, error = D4_Error("rail_route", "add trains with the commission tool") };
 	D4_ReconcileRoutes(store.registry, company_id);
-	if (route.vehicles.len() == 0) return { ok = false, error = D4_Error("no_vehicle_to_copy", params.route_id) };
-	local first = route.vehicles[0].vehicle_id;
 	local count = D4_ClampInt(D4_Has(params, "count") ? params.count : 1, 1, 1, 4);
 	if (route.vehicles.len() + count > DIRECTORATE_VEHICLE_MAX_PER_ROUTE) return { ok = false, error = D4_Error("route_full", DIRECTORATE_VEHICLE_MAX_PER_ROUTE.tostring() + " vehicles max") };
 	local reserve = D4_ClampInt(D4_Has(params, "reserve") ? params.reserve : 0, 0, 0, 100000000);
 	local mode = GSCompanyMode(company_id);
 	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", company_id.tostring()) };
+	if (route.vehicles.len() == 0) return D4_RestockRoute(route, company_id, count, reserve);
+	local first = route.vehicles[0].vehicle_id;
 	/* A model the game no longer sells cannot be cloned: build the best model on
 	 * sale for the same job instead, sharing the route's orders. */
 	local engine = GSVehicle.GetEngineType(first);
@@ -618,6 +618,36 @@ function D4_AddRouteVehicles(store, company_id, params) {
 	}
 	if (added.len() == 0) return { ok = false, error = D4_Error("insufficient_funds", GSEngine.GetPrice(engine).tostring() + " plus reserve " + reserve) };
 	return { ok = true, payload = { route_id = route.route_id, added = added, vehicles = route.vehicles.len(), model = D4_StringOr(GSEngine.GetName(engine), "", 48) } };
+}
+
+/* A route that lost every vehicle (crashes, disasters) has nothing to copy:
+ * buy the best model on sale for it and give it the route's orders again. */
+function D4_RestockRoute(route, company_id, count, reserve) {
+	/* Own company mode: "return D4_RestockRoute(...)" is a tail call, which
+	 * releases the caller's GSCompanyMode before this runs. */
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", company_id.tostring()) };
+	local depot = route.depot_tile;
+	local depot_ok = route.mode == "road" ? GSRoad.IsRoadDepotTile(depot) : route.mode == "water" ? GSMarine.IsWaterDepotTile(depot) : GSAirport.IsHangarTile(depot);
+	if (!depot_ok || GSTile.GetOwner(depot) != company_id) return { ok = false, error = D4_Error("depot_missing", "the route's depot or hangar is gone; build the route again") };
+	local engine = null;
+	if (route.mode == "road") engine = D4_PickEngine(GSVehicle.VT_ROAD, route.cargo_type, function(e) { return GSEngine.GetRoadType(e) == GSRoad.ROADTYPE_ROAD; });
+	else if (route.mode == "water") engine = D4_PickEngine(GSVehicle.VT_WATER, route.cargo_type, null);
+	else {
+		/* Big planes crash on small and commuter airports. */
+		local big_ok = true;
+		foreach (t in [route.source_station_tile, route.destination_station_tile]) {
+			local type = GSAirport.GetAirportType(t);
+			if (type == GSAirport.AT_SMALL || type == GSAirport.AT_COMMUTER) big_ok = false;
+		}
+		engine = D4_PickEngine(GSVehicle.VT_AIR, route.cargo_type, function(e) : (big_ok) { return big_ok || GSEngine.GetPlaneType(e) != GSAirport.PT_BIG_PLANE; });
+	}
+	if (engine == null) return { ok = false, error = D4_Error("vehicle_build_failed", "no model on sale for this route") };
+	local fleet = D4_BuildRouteVehicles(depot, engine, route.cargo_type, route.source_station_tile, route.destination_station_tile, count, company_id, reserve);
+	if (!fleet.ok) return fleet;
+	local added = [];
+	foreach (v in fleet.vehicles) { D4_AssignVehicleToRoute(route, v.vehicle_id, v.cost); added.append(v.vehicle_id); }
+	return { ok = true, payload = { route_id = route.route_id, added = added, vehicles = route.vehicles.len(), model = D4_StringOr(GSEngine.GetName(engine), "", 48), restocked = true } };
 }
 
 /* ---- fleet care ------------------------------------------------------------ */
@@ -692,6 +722,31 @@ function D4_ReconcileRoutes(registry, company_id) {
 			D4_ReplaceRetiredModels(registry, company_id);
 		}
 	}
+}
+
+/* A crashed vehicle simply vanishes from its route, so say what happened. */
+function D4_RecordCrash(registry, crash) {
+	if (crash == null) return;
+	local v = crash.GetVehicleID();
+	local reasons = {};
+	reasons[GSEventVehicleCrashed.CRASH_TRAIN] <- "train_collision";
+	reasons[GSEventVehicleCrashed.CRASH_RV_LEVEL_CROSSING] <- "level_crossing";
+	reasons[GSEventVehicleCrashed.CRASH_RV_UFO] <- "ufo";
+	reasons[GSEventVehicleCrashed.CRASH_PLANE_LANDING] <- "plane_landing";
+	reasons[GSEventVehicleCrashed.CRASH_AIRCRAFT_NO_AIRPORT] <- "aircraft_no_airport";
+	reasons[GSEventVehicleCrashed.CRASH_FLOODED] <- "flooded";
+	local reason = crash.GetCrashReason() in reasons ? reasons[crash.GetCrashReason()] : crash.GetCrashReason().tostring();
+	local route_id = "";
+	foreach (id, route in registry.routes) foreach (e in route.vehicles) if (e.vehicle_id == v) route_id = id;
+	local site = crash.GetCrashSite();
+	local detail = "v" + v + " " + reason + " at " + D4_PointKey(D4_FromTile(site));
+	if (GSVehicle.IsValidVehicle(v)) {
+		local e = GSVehicle.GetEngineType(v);
+		detail += " " + D4_StringOr(GSEngine.GetName(e), "", 32);
+		if (GSEngine.GetVehicleType(e) == GSVehicle.VT_AIR) detail += " plane_type=" + GSEngine.GetPlaneType(e) + " airport_type=" + GSAirport.GetAirportType(site);
+	}
+	registry.AddAlert(route_id, "warning", "vehicle_crashed", detail);
+	GSLog.Warning("D4 crash " + route_id + " " + detail);
 }
 
 /* Accept only engines that can do the old engine's job: same road type for road

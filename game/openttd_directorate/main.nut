@@ -27,6 +27,7 @@ function OpenTTDDirectorate::Start() {
 	if (this.store == null) this.store = DirectorateM4PlanStore();
 	if (this.bridge == null) this.bridge = DirectorateM4Bridge(this.store);
 	if (::D4_Camera == null) ::D4_Camera = DirectorateCamera();
+	GSLog.Info("D4 settings disasters=" + GSGameSettings.GetValue("difficulty.disasters") + " plane_crashes=" + GSGameSettings.GetValue("vehicle.plane_crashes") + " breakdowns=" + GSGameSettings.GetValue("difficulty.vehicle_breakdowns"));
 	if (this.pending_load != null) {
 		this.store.BeginLoad(this.pending_load);
 		this.pending_load = null;

@@ -13,7 +13,9 @@ class DirectorateM4Bridge {
 		local limit = D4_ClampInt(GSController.GetSetting("poll_limit"), 4, 1, 16);
 		for (local i = 0; i < limit && GSEventController.IsEventWaiting(); i++) {
 			local event = GSEventController.GetNextEvent();
-			if (event == null || event.GetEventType() != GSEvent.ET_ADMIN_PORT) continue;
+			if (event == null) continue;
+			if (event.GetEventType() == GSEvent.ET_VEHICLE_CRASHED) { D4_RecordCrash(this.store.registry, GSEventVehicleCrashed.Convert(event)); continue; }
+			if (event.GetEventType() != GSEvent.ET_ADMIN_PORT) continue;
 			local admin_event = GSEventAdminPort.Convert(event);
 			if (admin_event == null) continue;
 			this.Handle(admin_event.GetObject());
