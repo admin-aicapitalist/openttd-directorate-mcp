@@ -123,6 +123,7 @@ class DirectorateM4RouteRegistry {
 			if (!(id in this.routes)) continue;
 			local route = this.routes[id];
 			if (D4_Has(request, "company_id") && route.company_id != request.company_id) continue;
+			if (route.state == "commissioned") D4_UpdateRouteEconomics(route);
 			rows.append(this.Summary(route));
 		}
 		return { ok = true, payload = { routes = rows, alerts = this.RecentAlerts(limit), tick = D4_Tick() } };
@@ -364,6 +365,9 @@ function D4_VerifyRouteTopology(route, company_id) {
 	if (!GSRail.IsRailStationTile(route.destination_station_tile) || GSTile.GetOwner(route.destination_station_tile) != company_id) failures.append({ reason = "destination_station_missing", tile = route.destination_station_tile });
 	local connected = D4_AreStationsConnectedByRail(route.source_station_tile, route.destination_station_tile, company_id);
 	if (!connected) failures.append({ reason = "stations_not_connected" });
+	foreach (which, tile in { source = route.source_station_tile, destination = route.destination_station_tile }) {
+		if (GSRail.IsRailStationTile(tile) && !D4_PlatformHasTrackIn(tile)) failures.append({ reason = which + "_platform_unreachable", tile = tile });
+	}
 	if (D4_Has(route, "topology") && route.topology != null && D4_IsTable(route.topology) && D4_Has(route.topology, "kind") && route.topology.kind == "through_hub_roro") {
 		local source = D4_VerifyThroughHubEndpointTopology(route.topology.source, "source");
 		if (!source.ok) {
@@ -379,6 +383,31 @@ function D4_VerifyRouteTopology(route, company_id) {
 		}
 	}
 	return { ok = failures.len() == 0, failures = failures };
+}
+
+/* Adjacent rail tiles are not enough: a track laid across the platform's axis
+ * touches the station without entering it. Check that some track piece or depot
+ * just past a platform end actually runs into that platform. */
+function D4_PlatformHasTrackIn(station_tile) {
+	local station = GSStation.GetStationID(station_tile);
+	if (!GSStation.IsValidStation(station)) return false;
+	foreach (t, _ in GSTileList_StationType(station, GSStation.STATION_TRAIN)) {
+		local track = GSRail.GetRailStationDirection(t);
+		local p = D4_FromTile(t);
+		foreach (dir in (track == GSRail.RAILTRACK_NE_SW ? [DIR_NE, DIR_SW] : [DIR_NW, DIR_SE])) {
+			local beyond = D4_Offset(p, dir, 1);
+			if (!D4_IsPointOnMap(beyond)) continue;
+			local bt = D4_ToTile(beyond);
+			if (GSRail.IsRailStationTile(bt) && GSStation.GetStationID(bt) == station) continue;
+			if (GSRail.IsRailDepotTile(bt)) { if (GSRail.GetRailDepotFrontTile(bt) == t) return true; continue; }
+			if (!GSRail.IsRailTile(bt)) continue;
+			for (local d = 0; d < 4; d++) {
+				local far = D4_Offset(beyond, d, 1);
+				if (D4_IsPointOnMap(far) && GSRail.AreTilesConnected(t, bt, D4_ToTile(far))) return true;
+			}
+		}
+	}
+	return false;
 }
 
 function D4_AreStationsConnectedByRail(source_tile, destination_tile, company_id) {
@@ -531,6 +560,14 @@ function D4_UpdateRouteHealth(route) {
 		if (GSOrder.GetOrderCount(v.vehicle_id) < 2) { orders_ok = false; break; }
 	}
 	route.health.orders_ok = orders_ok && route.vehicles.len() > 0;
+	D4_UpdateRouteEconomics(route);
+	route.health.last_check_tick = D4_Tick();
+	return { topology_ok = topology.ok, orders_ok = route.health.orders_ok, vehicle_running = route.health.vehicle_running, positive_revenue = route.health.positive_revenue, topology_failures = topology.failures };
+}
+
+/* Profits and running state from the route's vehicles: cheap, so observe
+ * refreshes them on every call; verify adds the topology and order checks. */
+function D4_UpdateRouteEconomics(route) {
 	local running = false;
 	local profit_total = 0;
 	local last_year = 0;
@@ -549,8 +586,6 @@ function D4_UpdateRouteHealth(route) {
 	route.economics.last_year_profit = last_year;
 	route.economics.this_year_profit = this_year;
 	route.economics.lifetime_profit = profit_total;
-	route.health.last_check_tick = D4_Tick();
-	return { topology_ok = topology.ok, orders_ok = route.health.orders_ok, vehicle_running = running, positive_revenue = profit_total > 0 };
 }
 
 function D4_RouteRuntimeSnapshot(route) {

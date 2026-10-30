@@ -30,6 +30,10 @@ function D4_CompileBuildProgram(plan) {
 	local required_start_dir = D4_DirectionBetween(source_entry, start);
 	local required_goal_dir = D4_DirectionBetween(goal, destination_exit);
 	if (required_start_dir < 0 || required_goal_dir < 0) return { ok = false, error = D4_Error("program_invalid_station_heading", "") };
+	/* The first and last track pieces must run along the platform, or no train can enter the station. */
+	if (!D4_DirAlongTrack(required_start_dir, source_station.op.direction) || !D4_DirAlongTrack(required_goal_dir, destination_station.op.direction)) {
+		return { ok = false, error = D4_Error("program_station_axis_mismatch", "") };
+	}
 	local route = D4_BuildLegalCenterline(start, goal, plan.company_id, plan.policy, required_start_dir, required_goal_dir);
 	if (!route.ok) return route;
 	local paired = { ok = true, return_lane = [] };
@@ -562,6 +566,12 @@ function D4_DominantDirection(from, to) {
 	if (dx == 0 && dy == 0) return -1;
 	if (abs(dx) >= abs(dy)) return dx >= 0 ? DIR_NE : DIR_SW;
 	return dy >= 0 ? DIR_SE : DIR_NW;
+}
+
+function D4_DirAlongTrack(dir, track) {
+	if (track == GSRail.RAILTRACK_NE_SW) return dir == DIR_NE || dir == DIR_SW;
+	if (track == GSRail.RAILTRACK_NW_SE) return dir == DIR_NW || dir == DIR_SE;
+	return false;
 }
 
 function D4_StationRectOperation(op_id, blueprint, destination_station) {

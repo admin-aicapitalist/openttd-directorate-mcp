@@ -102,19 +102,22 @@ function D4_GetBlueprintDefinitions() {
 			origin = { x = 0, y = 0 },
 			station_name = "single_shuttle_1xN",
 			station_id = GSStation.STATION_NEW,
+			/* The platform runs along the throat's axis, away from it: the
+			 * station rectangle takes its track direction from its long side, and
+			 * a platform across the throat axis leaves no track into the station. */
 			tiles = [
 				D4_BlueprintTile({ x = 0, y = 0 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
-				D4_BlueprintTile({ x = 1, y = 0 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
-				D4_BlueprintTile({ x = 2, y = 0 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
-				D4_BlueprintTile({ x = 3, y = 0 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
-				D4_BlueprintTile({ x = 4, y = 0 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
+				D4_BlueprintTile({ x = 0, y = -1 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
+				D4_BlueprintTile({ x = 0, y = -2 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
+				D4_BlueprintTile({ x = 0, y = -3 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
+				D4_BlueprintTile({ x = 0, y = -4 }, "station", { num_platforms = 1, platform_length = 1, dir = DIR_NE }),
 				D4_BlueprintTile({ x = 0, y = 1 }, "rail", { dir = DIR_NE }),
 				D4_BlueprintTile({ x = 0, y = 2 }, "depot", { dir = DIR_NE, in_dir = DIR_NE, out_dir = DIR_NE }),
 			],
-			required_clear = [{ x = 0, y = 0 }, { x = 1, y = 0 }, { x = 2, y = 0 }, { x = 3, y = 0 }, { x = 4, y = 0 }, { x = 0, y = 1 }, { x = 0, y = 2 }],
+			required_clear = [{ x = 0, y = -4 }, { x = 0, y = -3 }, { x = 0, y = -2 }, { x = 0, y = -1 }, { x = 0, y = 0 }, { x = 0, y = 1 }, { x = 0, y = 2 }],
 			allowed_existing = [],
 			ports = {
-				platform_body = [{ x = 0, y = 0 }, { x = 1, y = 0 }, { x = 2, y = 0 }, { x = 3, y = 0 }, { x = 4, y = 0 }],
+				platform_body = [{ x = 0, y = 0 }, { x = 0, y = -1 }, { x = 0, y = -2 }, { x = 0, y = -3 }, { x = 0, y = -4 }],
 				throat = [{ x = 0, y = 1 }],
 				depot_mouth = [{ x = 0, y = 2 }],
 			},
