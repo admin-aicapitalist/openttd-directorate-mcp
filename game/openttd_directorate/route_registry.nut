@@ -649,3 +649,84 @@ function D4_VerifyRoute(registry, route_id, company_id, level) {
 	}
 	return { ok = false, error = D4_Error("invalid_level", level) };
 }
+
+/* tamago fork: repair a rail line after a disaster (UFO, mine subsidence, flood).
+ * The line's build program is replayed: every operation already in place is
+ * skipped, so only destroyed track, station tiles, depot and signals are built
+ * again. A train lost with the line is replaced. */
+function D4_RepairStationRect(op, company_id, test_only) {
+	local station = null, missing = [];
+	for (local x = op.point.x; x <= op.end_point.x; x++) {
+		for (local y = op.point.y; y <= op.end_point.y; y++) {
+			local t = D4_ToTile({ x = x, y = y });
+			if (GSRail.IsRailStationTile(t) && GSTile.GetOwner(t) == company_id) { if (station == null) station = GSStation.GetStationID(t); }
+			else missing.append(t);
+		}
+	}
+	if (missing.len() == 0) return { ok = true, reused = true, cost = 0 };
+	if (station == null) return D4_ExecuteProgramOperation(op, company_id, test_only);
+	local cost = 0;
+	foreach (t in missing) {
+		if (!GSRail.BuildRailStation(t, op.direction, 1, 1, station)) return { ok = false, failure = { reason = "station_build_failed", op_id = op.op_id, tile = t, error = GSError.GetLastErrorString() } };
+		cost += GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_STATION);
+	}
+	return { ok = true, reused = false, cost = cost };
+}
+
+function D4_RepairPass(ops, company_id, test_only) {
+	local tm = test_only ? GSTestMode() : null;
+	local missing = [], cost = 0, tested_rails = {};
+	foreach (op in ops) {
+		/* In test mode a signal on rail that is itself missing cannot be tested yet. */
+		if (test_only && op.kind == "signal" && op.tile in tested_rails && !GSRail.IsRailTile(op.tile)) {
+			missing.append(op.op_id);
+			cost += GSRail.GetBuildCost(GSRail.GetCurrentRailType(), GSRail.BT_SIGNAL);
+			continue;
+		}
+		local r = op.kind == "station_rect" ? D4_RepairStationRect(op, company_id, test_only) : D4_ExecuteProgramOperation(op, company_id, test_only);
+		if (!r.ok) return { ok = false, failure = r.failure, done = missing };
+		if (r.reused) continue;
+		missing.append(op.op_id);
+		cost += r.cost;
+		if (op.kind == "rail_connection") tested_rails[op.tile] <- true;
+	}
+	return { ok = true, missing = missing, cost = cost };
+}
+
+function D4_RepairRailRoute(store, company_id, params) {
+	if (!D4_Has(params, "route_id") || typeof params.route_id != "string") return { ok = false, error = D4_Error("invalid_route_id", "") };
+	local registry = store.registry;
+	local route = registry.Get(params.route_id);
+	if (route == null || route.company_id != company_id) return { ok = false, error = D4_Error("route_not_found", params.route_id) };
+	if (D4_Has(route, "mode") && route.mode != "rail") return { ok = false, error = D4_Error("not_rail", "road, water and air routes: restock with add_vehicle, or build again") };
+	local plan = store.GetPlan(route.plan_id);
+	if (plan == null || !D4_Has(plan, "build_program") || !D4_IsTable(plan.build_program) || !plan.build_program.ok) return { ok = false, error = D4_Error("plan_program_missing", route.plan_id) };
+	local reserve = D4_ClampInt(D4_Has(params, "reserve") ? params.reserve : 0, 0, 0, 100000000);
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", company_id.tostring()) };
+	if (!D4_SelectRailType()) return { ok = false, error = D4_Error("rail_type_unavailable", "") };
+	D4_ReconcileRoutes(registry, company_id);
+	local needs_train = route.vehicles.len() == 0;
+	local test = D4_RepairPass(plan.build_program.ops, company_id, true);
+	if (!test.ok) return { ok = false, error = D4_Error("repair_blocked", "something now stands where the line was; roll it back and build a new one"), failure = test.failure };
+	if (test.missing.len() == 0 && !needs_train) return { ok = true, payload = { route_id = route.route_id, rebuilt = 0, note = "nothing to repair" } };
+	if (D4_Has(params, "dry_run") && params.dry_run == true) return { ok = true, payload = { dry_run = true, route_id = route.route_id, missing = test.missing.len(), ops = test.missing.slice(0, D4_Min(24, test.missing.len())), estimated_cost = test.cost, needs_train = needs_train } };
+	if (!D4_EnsureCompanyFunds(company_id, test.cost + reserve)) return { ok = false, error = D4_Error("insufficient_funds", test.cost.tostring() + " plus reserve " + reserve) };
+	local money_before = GSCompany.GetBankBalance(company_id);
+	local done = D4_RepairPass(plan.build_program.ops, company_id, false);
+	if (!done.ok) return { ok = false, error = D4_Error("repair_failed", "partly repaired; call again to retry"), failure = done.failure, rebuilt = done.done.len() };
+	local topology = D4_VerifyRouteTopology(route, company_id);
+	route.health.topology_ok = topology.ok;
+	local train = null;
+	if (topology.ok && needs_train) {
+		local v = D4_BuildRouteVehicle(route, company_id, store);
+		if (v.ok) {
+			D4_AssignVehicleToRoute(route, v.vehicle_id, v.build_cost);
+			GSVehicle.StartStopVehicle(v.vehicle_id);
+			train = v.vehicle_id;
+		} else train = v.error;
+	}
+	registry.AddAlert(route.route_id, "info", "repaired", done.missing.len().tostring() + " pieces");
+	return { ok = true, payload = { route_id = route.route_id, rebuilt = done.missing.len(), ops = done.missing.slice(0, D4_Min(24, done.missing.len())),
+		cost = money_before - GSCompany.GetBankBalance(company_id), topology_ok = topology.ok, topology_failures = topology.failures, new_train = train } };
+}

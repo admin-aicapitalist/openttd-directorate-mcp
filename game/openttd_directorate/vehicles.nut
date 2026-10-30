@@ -840,4 +840,5 @@ DIRECTORATE_VEHICLE_COMMANDS <- {
 	list_towns = function(store, company_id, params) { return D4_ListTowns(params); },
 	list_vehicles = D4_ListCompanyVehicles,
 	set_autorenew = D4_SetAutoRenew,
+	repair_route = D4_RepairRailRoute,
 };
