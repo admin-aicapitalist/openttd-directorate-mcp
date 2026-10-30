@@ -116,6 +116,7 @@ class DirectorateM4RouteRegistry {
 
 	function Observe(request) {
 		local limit = D4_ClampInt(D4_Has(request, "limit") ? request.limit : 64, 64, 1, 256);
+		if (D4_Has(request, "company_id")) D4_ReconcileRoutes(this, request.company_id);
 		local rows = [];
 		for (local i = this.order.len() - 1; i >= 0 && rows.len() < limit; i--) {
 			local id = this.order[i];
@@ -602,6 +603,7 @@ function D4_VerifyRoute(registry, route_id, company_id, level) {
 	local route = registry.Get(route_id);
 	if (route == null) return { ok = false, error = D4_Error("route_not_found", route_id) };
 	if (route.company_id != company_id) return { ok = false, error = D4_Error("company_mismatch", route_id) };
+	D4_ReconcileRoutes(registry, company_id);
 	local health = D4_UpdateRouteHealth(route);
 	if (level == "topology") return { ok = health.topology_ok, health = health };
 	if (level == "commissioning") return { ok = health.topology_ok && health.orders_ok && route.state == "commissioned", health = health };

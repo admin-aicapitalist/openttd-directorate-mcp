@@ -577,19 +577,36 @@ function D4_AddRouteVehicles(store, company_id, params) {
 	local route = store.registry.Get(params.route_id);
 	if (route == null || route.company_id != company_id) return { ok = false, error = D4_Error("route_not_found", params.route_id) };
 	if (!D4_Has(route, "mode") || route.mode == "rail") return { ok = false, error = D4_Error("rail_route", "add trains with the commission tool") };
-	local first = null;
-	foreach (v in route.vehicles) if (GSVehicle.IsValidVehicle(v.vehicle_id)) { first = v.vehicle_id; break; }
-	if (first == null) return { ok = false, error = D4_Error("no_vehicle_to_copy", params.route_id) };
+	D4_ReconcileRoutes(store.registry, company_id);
+	if (route.vehicles.len() == 0) return { ok = false, error = D4_Error("no_vehicle_to_copy", params.route_id) };
+	local first = route.vehicles[0].vehicle_id;
 	local count = D4_ClampInt(D4_Has(params, "count") ? params.count : 1, 1, 1, 4);
 	if (route.vehicles.len() + count > DIRECTORATE_VEHICLE_MAX_PER_ROUTE) return { ok = false, error = D4_Error("route_full", DIRECTORATE_VEHICLE_MAX_PER_ROUTE.tostring() + " vehicles max") };
 	local reserve = D4_ClampInt(D4_Has(params, "reserve") ? params.reserve : 0, 0, 0, 100000000);
 	local mode = GSCompanyMode(company_id);
 	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", company_id.tostring()) };
+	/* A model the game no longer sells cannot be cloned: build the best model on
+	 * sale for the same job instead, sharing the route's orders. */
+	local engine = GSVehicle.GetEngineType(first);
+	if (!GSEngine.IsBuildable(engine)) {
+		engine = D4_PickEngine(GSEngine.GetVehicleType(engine), route.cargo_type, D4_SameJobFilter(engine));
+		if (engine == null) return { ok = false, error = D4_Error("vehicle_build_failed", "no model on sale for this route") };
+	}
 	local added = [];
 	for (local i = 0; i < count; i++) {
-		local price = GSEngine.GetPrice(GSVehicle.GetEngineType(first));
+		local price = GSEngine.GetPrice(engine);
 		if (!D4_EnsureCompanyFunds(company_id, price + reserve)) break;
-		local v = GSVehicle.CloneVehicle(route.depot_tile, first, true);
+		local v = null;
+		if (GSVehicle.GetEngineType(first) == engine) v = GSVehicle.CloneVehicle(route.depot_tile, first, true);
+		else {
+			v = GSEngine.GetCargoType(engine) == route.cargo_type ? GSVehicle.BuildVehicle(route.depot_tile, engine) : GSVehicle.BuildVehicleWithRefit(route.depot_tile, engine, route.cargo_type);
+			if (GSVehicle.IsValidVehicle(v) && !GSOrder.ShareOrders(v, first)) {
+				local err = GSError.GetLastErrorString();
+				GSVehicle.SellVehicle(v);
+				if (added.len() == 0) return { ok = false, error = D4_Error("orders_failed", err) };
+				break;
+			}
+		}
 		if (!GSVehicle.IsValidVehicle(v)) {
 			if (added.len() == 0) return { ok = false, error = D4_Error("vehicle_build_failed", GSError.GetLastErrorString()) };
 			break;
@@ -597,9 +614,119 @@ function D4_AddRouteVehicles(store, company_id, params) {
 		GSVehicle.StartStopVehicle(v);
 		D4_AssignVehicleToRoute(route, v, price);
 		added.append(v);
+		first = v;
 	}
-	if (added.len() == 0) return { ok = false, error = D4_Error("insufficient_funds", GSEngine.GetPrice(GSVehicle.GetEngineType(first)).tostring() + " plus reserve " + reserve) };
-	return { ok = true, payload = { route_id = route.route_id, added = added, vehicles = route.vehicles.len() } };
+	if (added.len() == 0) return { ok = false, error = D4_Error("insufficient_funds", GSEngine.GetPrice(engine).tostring() + " plus reserve " + reserve) };
+	return { ok = true, payload = { route_id = route.route_id, added = added, vehicles = route.vehicles.len(), model = D4_StringOr(GSEngine.GetName(engine), "", 48) } };
+}
+
+/* ---- fleet care ------------------------------------------------------------ */
+
+/* Autorenew and autoreplace build a new vehicle with a new id and sell the old
+ * one, and the game later hands the freed id to an unrelated vehicle. So a
+ * route's vehicles are found by what they do: a vehicle belongs to a route when
+ * its first two orders go to the route's two stations, in that order. */
+::D4_FleetCheckedTick <- {};
+::D4_ReplaceCheckedMonth <- {};
+
+function D4_StationKey(source_tile, destination_tile) {
+	return GSStation.GetStationID(source_tile).tostring() + ">" + GSStation.GetStationID(destination_tile).tostring();
+}
+
+function D4_VehicleRouteKey(v) {
+	if (GSOrder.GetOrderCount(v) < 2 || !GSOrder.IsGotoStationOrder(v, 0) || !GSOrder.IsGotoStationOrder(v, 1)) return null;
+	return D4_StationKey(GSOrder.GetOrderDestination(v, 0), GSOrder.GetOrderDestination(v, 1));
+}
+
+/* Drop vehicles a route no longer has (sold, renewed, or an id now used by
+ * another vehicle) and pick up the ones that took their place. Runs at most once
+ * per game tick per company. */
+function D4_ReconcileRoutes(registry, company_id) {
+	local now = D4_Tick();
+	if (company_id in ::D4_FleetCheckedTick && ::D4_FleetCheckedTick[company_id] == now) return;
+	::D4_FleetCheckedTick[company_id] <- now;
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid()) return;
+	local by_key = {};
+	foreach (v, _ in GSVehicleList()) {
+		local key = D4_VehicleRouteKey(v);
+		if (key == null) continue;
+		if (!(key in by_key)) by_key[key] <- [];
+		by_key[key].append(v);
+	}
+	local claimed = {}, keys = {}, lost = {};
+	foreach (id in registry.order) {
+		if (!(id in registry.routes) || registry.routes[id].company_id != company_id) continue;
+		local route = registry.routes[id];
+		keys[id] <- D4_StationKey(route.source_station_tile, route.destination_station_tile);
+		local kept = [];
+		foreach (e in route.vehicles) {
+			local v = e.vehicle_id;
+			if (GSVehicle.IsValidVehicle(v) && !(v in claimed) && D4_VehicleRouteKey(v) == keys[id]) { kept.append(e); claimed[v] <- id; }
+		}
+		lost[id] <- route.vehicles.len() - kept.len();
+		route.vehicles = kept;
+	}
+	/* Replacements go first to the routes that lost vehicles, then to the oldest
+	 * route on the same pair of stations. */
+	foreach (pass in [true, false]) {
+		foreach (id in registry.order) {
+			if (!(id in keys) || (pass && lost[id] <= 0)) continue;
+			local key = keys[id];
+			if (!(key in by_key)) continue;
+			local route = registry.routes[id];
+			foreach (v in by_key[key]) {
+				if (v in claimed || route.vehicles.len() >= DIRECTORATE_M4_MAX_ROUTE_VEHICLES) continue;
+				if (pass && lost[id] <= 0) break;
+				route.vehicles.append({ vehicle_id = v, created_tick = now, build_cost = 0 });
+				claimed[v] <- id;
+				lost[id]--;
+				registry.AddAlert(id, "info", "vehicle_adopted", v.tostring());
+			}
+		}
+	}
+	if (GSCompany.GetAutoRenewStatus(company_id)) {
+		local month = GSDate.GetYear(GSDate.GetCurrentDate()) * 12 + GSDate.GetMonth(GSDate.GetCurrentDate());
+		if (!(company_id in ::D4_ReplaceCheckedMonth) || ::D4_ReplaceCheckedMonth[company_id] != month) {
+			::D4_ReplaceCheckedMonth[company_id] <- month;
+			D4_ReplaceRetiredModels(registry, company_id);
+		}
+	}
+}
+
+/* Accept only engines that can do the old engine's job: same road type for road
+ * vehicles, same plane size for aircraft (a big plane crashes on a small airport). */
+function D4_SameJobFilter(old) {
+	local vt = GSEngine.GetVehicleType(old);
+	if (vt == GSVehicle.VT_AIR) return function(e) : (old) { return GSEngine.GetPlaneType(e) == GSEngine.GetPlaneType(old); };
+	if (vt == GSVehicle.VT_ROAD) return function(e) : (old) { return GSEngine.GetRoadType(e) == GSEngine.GetRoadType(old); };
+	return null;
+}
+
+/* Autorenew only rebuilds the same model, and a model the game no longer sells
+ * cannot be rebuilt, so those vehicles age to 0% reliability. Point each retired
+ * model at the best one on sale for the same job: the vehicles are then replaced
+ * on their next depot visit. Trains are left alone (rail type and wagons). */
+function D4_ReplaceRetiredModels(registry, company_id) {
+	local mode = GSCompanyMode(company_id);
+	if (!GSCompanyMode.IsValid()) return [];
+	local done = [], seen = {};
+	foreach (id, route in registry.routes) {
+		if (route.company_id != company_id) continue;
+		foreach (e in route.vehicles) {
+			if (!GSVehicle.IsValidVehicle(e.vehicle_id)) continue;
+			local old = GSVehicle.GetEngineType(e.vehicle_id);
+			if (old in seen || GSEngine.IsBuildable(old)) continue;
+			seen[old] <- true;
+			local vt = GSEngine.GetVehicleType(old);
+			if (vt == GSVehicle.VT_RAIL) continue;
+			local next = D4_PickEngine(vt, route.cargo_type, D4_SameJobFilter(old));
+			if (next == null) continue;
+			if (GSGroup.GetEngineReplacement(GSGroup.GROUP_ALL, old) != next && !GSGroup.SetAutoReplace(GSGroup.GROUP_ALL, old, next)) continue;
+			done.append({ from = D4_StringOr(GSEngine.GetName(old), "", 48), to = D4_StringOr(GSEngine.GetName(next), "", 48) });
+		}
+	}
+	return done;
 }
 
 function D4_ListTowns(params) {
@@ -622,6 +749,7 @@ function D4_ListTowns(params) {
 
 function D4_ListCompanyVehicles(store, company_id, params) {
 	local limit = D4_ClampInt(D4_Has(params, "limit") ? params.limit : 64, 64, 1, 128);
+	D4_ReconcileRoutes(store.registry, company_id);
 	local route_of = {};
 	foreach (id, route in store.registry.routes) foreach (v in route.vehicles) route_of[v.vehicle_id] <- id;
 	local mode = GSCompanyMode(company_id);
@@ -637,14 +765,15 @@ function D4_ListCompanyVehicles(store, company_id, params) {
 	return { ok = true, payload = { vehicles = rows, count = rows.len(), states = "0 running, 1 stopped, 2 in depot, 3 at station, 4 broken down, 5 crashed" } };
 }
 
-function D4_SetAutoRenew(company_id, params) {
+function D4_SetAutoRenew(store, company_id, params) {
 	local mode = GSCompanyMode(company_id);
 	if (!GSCompanyMode.IsValid()) return { ok = false, error = D4_Error("invalid_company", company_id.tostring()) };
 	local enabled = !D4_Has(params, "enabled") || params.enabled == true;
 	if (!GSCompany.SetAutoRenewStatus(enabled)) return { ok = false, error = D4_Error("autorenew_failed", GSError.GetLastErrorString()) };
 	if (D4_Has(params, "months_before") && typeof params.months_before == "integer") GSCompany.SetAutoRenewMonths(D4_ClampInt(params.months_before, 6, -12, 12));
 	if (D4_Has(params, "min_money") && typeof params.min_money == "integer") GSCompany.SetAutoRenewMoney(D4_ClampInt(params.min_money, 0, 0, 100000000));
-	return { ok = true, payload = { enabled = GSCompany.GetAutoRenewStatus(company_id), months_before = GSCompany.GetAutoRenewMonths(company_id), min_money = GSCompany.GetAutoRenewMoney(company_id) } };
+	local replacing = enabled ? D4_ReplaceRetiredModels(store.registry, company_id) : [];
+	return { ok = true, payload = { enabled = GSCompany.GetAutoRenewStatus(company_id), months_before = GSCompany.GetAutoRenewMonths(company_id), min_money = GSCompany.GetAutoRenewMoney(company_id), replacing_retired_models = replacing } };
 }
 
 /* bridge.nut dispatch: command -> handler(store, company_id, params). */
@@ -655,5 +784,5 @@ DIRECTORATE_VEHICLE_COMMANDS <- {
 	add_vehicle = D4_AddRouteVehicles,
 	list_towns = function(store, company_id, params) { return D4_ListTowns(params); },
 	list_vehicles = D4_ListCompanyVehicles,
-	set_autorenew = function(store, company_id, params) { return D4_SetAutoRenew(company_id, params); },
+	set_autorenew = D4_SetAutoRenew,
 };
